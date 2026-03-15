@@ -4,6 +4,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
 from typing import Optional
 from app.database import Base
+from app.core.time import utc_now_naive
 
 
 class Task(Base):
@@ -17,7 +18,7 @@ class Task(Base):
     result: Mapped[Optional[dict]] = mapped_column(JSONB)
     error: Mapped[Optional[str]] = mapped_column(String(1000))
     project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utc_now_naive, onupdate=utc_now_naive
     )

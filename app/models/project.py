@@ -4,6 +4,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
 from typing import Optional
 from app.database import Base
+from app.core.time import utc_now_naive
 
 
 class Project(Base):
@@ -33,9 +34,9 @@ class Project(Base):
         },
     )
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime, default=utc_now_naive, onupdate=utc_now_naive
     )
 
     __table_args__ = (

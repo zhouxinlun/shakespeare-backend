@@ -3,7 +3,15 @@ from types import SimpleNamespace
 
 from pydantic import ValidationError
 
-from app.schemas.novel import NovelCreate, NovelEvaluateBatchRequest, NovelEvaluateLiveRequest, NovelParseRequest, NovelUpdate
+from app.schemas.novel import (
+    NovelCreate,
+    NovelEvaluateBatchRequest,
+    NovelEvaluateBookRequest,
+    NovelEvaluateLiveRequest,
+    NovelParseRequest,
+    NovelUpdate,
+)
+from app.services.novel_book_evaluator import NovelBookEvaluator
 from app.services.novel_evaluator import NovelEvaluator
 from app.services.novel_parser import NovelParser
 
@@ -52,6 +60,20 @@ class TestNovelSchemaValidation(unittest.TestCase):
             NovelEvaluateBatchRequest(novel_ids=[])
         with self.assertRaises(ValidationError):
             NovelEvaluateBatchRequest(novel_ids=[1, 1])
+
+    def test_book_request_validates_optional_lists(self):
+        payload = NovelEvaluateBookRequest(
+            novel_ids=[1, 2],
+            focus_areas=[" character_consistency ", "timeline"],
+            include_benchmarking=False,
+        )
+        self.assertEqual(payload.novel_ids, [1, 2])
+        self.assertEqual(payload.focus_areas, ["character_consistency", "timeline"])
+        self.assertFalse(payload.include_benchmarking)
+        with self.assertRaises(ValidationError):
+            NovelEvaluateBookRequest(novel_ids=[1, 1])
+        with self.assertRaises(ValidationError):
+            NovelEvaluateBookRequest(chapters_to_evaluate=[])
 
 
 class TestNovelParserRules(unittest.TestCase):
@@ -144,6 +166,49 @@ class TestNovelEvaluator(unittest.TestCase):
         evaluator = NovelEvaluator(content_type="web_novel")
         self.assertIn("plot_momentum", evaluator.dimensions)
         self.assertEqual(evaluator.content_type, "web_novel")
+
+    def test_normalize_scores_uses_default_missing_score(self):
+        evaluator = NovelEvaluator(content_type="short_drama")
+        normalized = evaluator._normalize_scores({"opening_hook": "bad"})  # noqa: SLF001
+        self.assertEqual(normalized["opening_hook"], evaluator.DEFAULT_MISSING_SCORE)
+        self.assertEqual(normalized["conflict_density"], evaluator.DEFAULT_MISSING_SCORE)
+
+
+class TestNovelBookEvaluator(unittest.TestCase):
+    def test_build_report_outputs_core_sections(self):
+        evaluator = NovelBookEvaluator(content_type="short_drama")
+        novels = [
+            SimpleNamespace(id=1, chapter_index=1, chapter_title="第1章", volume="正文", word_count=1200),
+            SimpleNamespace(id=2, chapter_index=2, chapter_title="第2章", volume="正文", word_count=1100),
+        ]
+        evaluations = [
+            SimpleNamespace(
+                novel_id=1,
+                overall_score=7.8,
+                dimension_scores={"opening_hook": 8, "cliffhanger_strength": 7.5, "serialized_drive": 7.2},
+                suggestions=[{"priority": "medium"}],
+            ),
+            SimpleNamespace(
+                novel_id=2,
+                overall_score=6.1,
+                dimension_scores={"opening_hook": 6.2, "cliffhanger_strength": 5.6, "serialized_drive": 6.0},
+                suggestions=[{"priority": "high"}, {"priority": "high"}],
+            ),
+        ]
+
+        report = evaluator.build_report(novels=novels, evaluations=evaluations, include_benchmarking=True)
+        self.assertIn("aggregated_stats", report)
+        self.assertIn("consistency_issues", report)
+        self.assertIn("overall_assessment", report)
+        self.assertEqual(report["aggregated_stats"]["total_chapters"], 2)
+        self.assertAlmostEqual(report["overall_assessment"]["overall_score"], 6.95)
+        self.assertGreaterEqual(len(report["overall_assessment"]["improvement_priorities"]), 1)
+
+    def test_build_report_rejects_missing_evaluations(self):
+        evaluator = NovelBookEvaluator(content_type="short_drama")
+        novels = [SimpleNamespace(id=1, chapter_index=1, chapter_title="第1章", volume="正文", word_count=1200)]
+        with self.assertRaises(ValueError):
+            evaluator.build_report(novels=novels, evaluations=[])
 
 
 if __name__ == "__main__":

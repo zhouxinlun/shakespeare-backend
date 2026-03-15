@@ -5,6 +5,7 @@ from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstr
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.time import utc_now_naive
 from app.database import Base
 
 
@@ -21,11 +22,11 @@ class Novel(Base):
     content: Mapped[str] = mapped_column(Text)
     word_count: Mapped[int] = mapped_column(Integer, default=0)
     project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=utc_now_naive,
+        onupdate=utc_now_naive,
     )
 
 
@@ -52,9 +53,32 @@ class NovelEvaluation(Base):
     model_used: Mapped[str] = mapped_column(String(100), default="novel_evaluator")
     prompt_version: Mapped[str] = mapped_column(String(50), default="short_drama.v1")
     project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
+        default=utc_now_naive,
+        onupdate=utc_now_naive,
+    )
+
+
+class BookEvaluation(Base):
+    __tablename__ = "book_evaluations"
+    __table_args__ = (
+        Index("idx_book_evaluations_project_created", "project_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
+    content_type: Mapped[str] = mapped_column(String(50), default="short_drama")
+    evaluated_novel_ids: Mapped[list] = mapped_column(JSONB, default=list)
+    aggregated_stats: Mapped[dict] = mapped_column(JSONB, default=dict)
+    consistency_issues: Mapped[list] = mapped_column(JSONB, default=list)
+    overall_assessment: Mapped[dict] = mapped_column(JSONB, default=dict)
+    model_used: Mapped[str] = mapped_column(String(100), default="book_evaluator")
+    prompt_version: Mapped[str] = mapped_column(String(50), default="book.v1")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=utc_now_naive,
+        onupdate=utc_now_naive,
     )

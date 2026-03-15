@@ -1,6 +1,7 @@
+import asyncio
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import AsyncIterator, List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -9,12 +10,15 @@ from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
-from app.database import get_db
-from app.models.novel import Novel, NovelEvaluation
+from app.database import AsyncSessionLocal, get_db
+from app.models.novel import BookEvaluation, Novel, NovelEvaluation
 from app.models.project import Project
 from app.models.user import User
 from app.schemas.novel import (
+    BookEvaluationHistoryOut,
+    BookEvaluationOut,
     NovelBatchCreate,
+    NovelEvaluateBookRequest,
     NovelEvaluateBatchRequest,
     NovelEvaluationOut,
     NovelEvaluateLiveRequest,
@@ -25,16 +29,33 @@ from app.schemas.novel import (
     NovelStatsOut,
     NovelUpdate,
 )
+from app.services.novel_book_evaluator import NovelBookEvaluator
 from app.services.novel_evaluator import get_evaluator_by_content_type
 from app.services.novel_parser import NovelParser
 
 router = APIRouter(tags=["novel"])
 novel_router = APIRouter(prefix="/projects/{project_id}/novels", tags=["novel"])
+BATCH_EVALUATION_MAX_CONCURRENCY = 3
 
 
 def _count_words(text: str) -> int:
     compact = re.sub(r"\s+", "", text or "")
     return len(compact)
+
+
+async def _evaluate_with_isolated_session(
+    *,
+    evaluator,
+    novel: Novel,
+    user_id: int,
+) -> tuple[dict, list[dict]]:
+    # AsyncSession is not safe for concurrent awaits; each evaluation task gets its own session.
+    async with AsyncSessionLocal() as isolated_db:
+        return await evaluator.evaluate_single(
+            novel=novel,
+            db=isolated_db,
+            user_id=user_id,
+        )
 
 
 async def _get_user_project(project_id: int, user: User, db: AsyncSession) -> Project:
@@ -99,6 +120,22 @@ def _serialize_evaluation(evaluation: NovelEvaluation) -> dict:
         "model_used": evaluation.model_used,
         "prompt_version": evaluation.prompt_version,
         "project_id": evaluation.project_id,
+        "created_at": evaluation.created_at.isoformat() if evaluation.created_at else None,
+        "updated_at": evaluation.updated_at.isoformat() if evaluation.updated_at else None,
+    }
+
+
+def _serialize_book_evaluation(evaluation: BookEvaluation) -> dict:
+    return {
+        "id": evaluation.id,
+        "project_id": evaluation.project_id,
+        "content_type": evaluation.content_type,
+        "evaluated_novel_ids": evaluation.evaluated_novel_ids or [],
+        "aggregated_stats": evaluation.aggregated_stats or {},
+        "consistency_issues": evaluation.consistency_issues or [],
+        "overall_assessment": evaluation.overall_assessment or {},
+        "model_used": evaluation.model_used,
+        "prompt_version": evaluation.prompt_version,
         "created_at": evaluation.created_at.isoformat() if evaluation.created_at else None,
         "updated_at": evaluation.updated_at.isoformat() if evaluation.updated_at else None,
     }
@@ -323,7 +360,7 @@ async def evaluate_novel_live(
     return {
         **live_result,
         "novel_id": novel.id,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
     }
 
 
@@ -433,56 +470,93 @@ async def evaluate_batch_novels(
 
     async def stream():
         results: list[dict] = []
-        for idx, novel in enumerate(novels, start=1):
-            title = novel.chapter_title or f"第{novel.chapter_index}章"
-            yield {
-                "type": "progress",
-                "status": "processing",
-                "current": idx,
-                "total": len(novels),
-                "novel_id": novel.id,
-                "chapter": title,
-            }
+        semaphore = asyncio.Semaphore(BATCH_EVALUATION_MAX_CONCURRENCY)
 
-            try:
-                evaluation_data, fallback_events = await evaluator.evaluate_single(
-                    novel=novel,
-                    db=db,
-                    user_id=user.id,
-                )
-            except Exception as exc:
-                results.append(
-                    {
-                        "novel_id": novel.id,
-                        "chapter_title": title,
+        async def run_one(novel: Novel) -> dict:
+            title = novel.chapter_title or f"第{novel.chapter_index}章"
+            async with semaphore:
+                try:
+                    evaluation_data, fallback_events = await _evaluate_with_isolated_session(
+                        evaluator=evaluator,
+                        novel=novel,
+                        user_id=user.id,
+                    )
+                    return {
+                        "novel": novel,
+                        "title": title,
+                        "evaluation_data": evaluation_data,
+                        "fallback_events": fallback_events,
+                    }
+                except Exception as exc:
+                    return {
+                        "novel": novel,
+                        "title": title,
                         "error": str(exc),
                     }
-                )
-                continue
 
-            for event in fallback_events:
-                yield event
+        tasks = [asyncio.create_task(run_one(novel)) for novel in novels]
+        completed = 0
 
-            previous = await _get_latest_evaluation(novel.id, project_id, db)
-            evaluation = _build_evaluation_record(
-                novel=novel,
-                project=project,
-                evaluation_data=evaluation_data,
-                previous=previous,
-            )
-            db.add(evaluation)
-            await db.flush()
+        try:
+            for done_task in asyncio.as_completed(tasks):
+                payload = await done_task
+                novel = payload["novel"]
+                title = payload["title"]
+                completed += 1
 
-            results.append(
-                {
+                yield {
+                    "type": "progress",
+                    "status": "processing",
+                    "current": completed,
+                    "total": len(novels),
                     "novel_id": novel.id,
-                    "chapter_title": title,
-                    "overall_score": evaluation.overall_score,
-                    "evaluation": _serialize_evaluation(evaluation),
+                    "chapter": title,
                 }
-            )
+
+                if payload.get("error"):
+                    results.append(
+                        {
+                            "_chapter_index": novel.chapter_index,
+                            "novel_id": novel.id,
+                            "chapter_title": title,
+                            "error": payload["error"],
+                        }
+                    )
+                    continue
+
+                for event in payload.get("fallback_events") or []:
+                    yield event
+
+                previous = await _get_latest_evaluation(novel.id, project_id, db)
+                evaluation = _build_evaluation_record(
+                    novel=novel,
+                    project=project,
+                    evaluation_data=payload["evaluation_data"],
+                    previous=previous,
+                )
+                db.add(evaluation)
+                await db.flush()
+
+                results.append(
+                    {
+                        "_chapter_index": novel.chapter_index,
+                        "novel_id": novel.id,
+                        "chapter_title": title,
+                        "overall_score": evaluation.overall_score,
+                        "evaluation": _serialize_evaluation(evaluation),
+                    }
+                )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         await db.commit()
+        results.sort(key=lambda item: int(item.get("_chapter_index", 0)))
+        for item in results:
+            item.pop("_chapter_index", None)
         yield {
             "type": "complete",
             "total": len(novels),
@@ -490,6 +564,128 @@ async def evaluate_batch_novels(
         }
 
     return _stream_response(stream())
+
+
+@novel_router.post("/evaluate-book", response_model=BookEvaluationOut)
+async def evaluate_book(
+    project_id: int,
+    body: NovelEvaluateBookRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await _get_user_project(project_id, user, db)
+    evaluator = get_evaluator_by_content_type(project.content_type)
+
+    result = await db.execute(
+        select(Novel).where(Novel.project_id == project_id).order_by(Novel.chapter_index)
+    )
+    novels = result.scalars().all()
+    if not novels:
+        raise HTTPException(status_code=400, detail="当前项目没有章节，无法执行全书评估")
+
+    if body.novel_ids and body.chapters_to_evaluate:
+        raise HTTPException(status_code=400, detail="novel_ids 与 chapters_to_evaluate 不能同时传入")
+
+    if body.novel_ids:
+        novel_id_set = set(body.novel_ids)
+        selected_novels = [item for item in novels if item.id in novel_id_set]
+        if len(selected_novels) != len(novel_id_set):
+            raise HTTPException(status_code=404, detail="novel_ids 中包含无效章节")
+    elif body.chapters_to_evaluate:
+        chapter_index_set = set(body.chapters_to_evaluate)
+        selected_novels = [item for item in novels if item.chapter_index in chapter_index_set]
+        if len(selected_novels) != len(chapter_index_set):
+            raise HTTPException(status_code=404, detail="chapters_to_evaluate 中包含无效章节序号")
+    else:
+        selected_novels = novels
+
+    latest_map: dict[int, NovelEvaluation] = {}
+    for novel in selected_novels:
+        latest = await _get_latest_evaluation(novel.id, project_id, db)
+        if body.force_re_evaluate or not latest:
+            try:
+                evaluation_data, _ = await evaluator.evaluate_single(
+                    novel=novel,
+                    db=db,
+                    user_id=user.id,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"章节评估失败（第{novel.chapter_index}章）: {exc}",
+                ) from exc
+
+            evaluation = _build_evaluation_record(
+                novel=novel,
+                project=project,
+                evaluation_data=evaluation_data,
+                previous=latest,
+            )
+            db.add(evaluation)
+            await db.flush()
+            latest = evaluation
+        if latest:
+            latest_map[novel.id] = latest
+
+    selected_evaluations = [latest_map[item.id] for item in selected_novels if item.id in latest_map]
+    if len(selected_evaluations) != len(selected_novels):
+        raise HTTPException(status_code=500, detail="部分章节缺少评估结果，请先执行章节评估")
+
+    book_evaluator = NovelBookEvaluator(content_type=project.content_type)
+    report = book_evaluator.build_report(
+        novels=selected_novels,
+        evaluations=selected_evaluations,
+        focus_areas=set(body.focus_areas or []),
+        include_benchmarking=body.include_benchmarking,
+    )
+
+    record = BookEvaluation(
+        project_id=project_id,
+        content_type=project.content_type,
+        evaluated_novel_ids=report["evaluated_novel_ids"],
+        aggregated_stats=report["aggregated_stats"],
+        consistency_issues=report["consistency_issues"],
+        overall_assessment=report["overall_assessment"],
+        model_used=report["model_used"],
+        prompt_version=report["prompt_version"],
+    )
+    db.add(record)
+    await db.flush()
+    await db.commit()
+    await db.refresh(record)
+    return BookEvaluationOut.model_validate(record)
+
+
+@novel_router.get("/book/history", response_model=BookEvaluationHistoryOut)
+async def list_book_evaluation_history(
+    project_id: int,
+    limit: int = 10,
+    offset: int = 0,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_user_project(project_id, user, db)
+
+    if limit <= 0 or limit > 50:
+        raise HTTPException(status_code=400, detail="limit 取值范围为 1-50")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset 不能小于 0")
+
+    total = await db.scalar(
+        select(func.count(BookEvaluation.id)).where(BookEvaluation.project_id == project_id)
+    )
+    result = await db.execute(
+        select(BookEvaluation)
+        .where(BookEvaluation.project_id == project_id)
+        .order_by(BookEvaluation.created_at.desc(), BookEvaluation.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = result.scalars().all()
+    return BookEvaluationHistoryOut(
+        total=int(total or 0),
+        evaluations=[BookEvaluationOut.model_validate(row) for row in rows],
+    )
 
 
 @novel_router.get("/{novel_id}/evaluations", response_model=List[NovelEvaluationOut])

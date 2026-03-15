@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import or_, select
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional, Literal, TypedDict
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.database import get_db
 from app.core.deps import get_current_user
@@ -686,7 +686,7 @@ def _set_config_test_result(
 ) -> None:
     config.last_test_status = status
     config.last_test_summary = _truncate_summary(summary)
-    config.last_tested_at = datetime.utcnow()
+    config.last_tested_at = datetime.now(tz=timezone.utc)
     if result is None:
         config.supports_tools = None
         config.supports_thinking = None

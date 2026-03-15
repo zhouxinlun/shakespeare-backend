@@ -173,6 +173,35 @@ class NovelEvaluateBatchRequest(BaseModel):
         return value
 
 
+class NovelEvaluateBookRequest(BaseModel):
+    novel_ids: Optional[list[int]] = None
+    chapters_to_evaluate: Optional[list[int]] = None
+    focus_areas: Optional[list[str]] = None
+    include_benchmarking: bool = True
+    force_re_evaluate: bool = False
+
+    @field_validator("novel_ids", "chapters_to_evaluate")
+    @classmethod
+    def validate_optional_id_list(cls, value: Optional[list[int]]) -> Optional[list[int]]:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("列表不能为空")
+        if len(value) != len(set(value)):
+            raise ValueError("列表内不能重复")
+        if any(item <= 0 for item in value):
+            raise ValueError("列表元素必须全部为正整数")
+        return value
+
+    @field_validator("focus_areas")
+    @classmethod
+    def normalize_focus_areas(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        if value is None:
+            return None
+        normalized = [str(item).strip() for item in value if str(item).strip()]
+        return normalized or None
+
+
 class NovelEvaluationSuggestion(BaseModel):
     dimension: str
     issue: str
@@ -204,6 +233,27 @@ class NovelEvaluationOut(BaseModel):
 class NovelLatestEvaluationOut(BaseModel):
     novel_id: int
     evaluation: NovelEvaluationOut
+
+
+class BookEvaluationOut(BaseModel):
+    id: int
+    project_id: int
+    content_type: str
+    evaluated_novel_ids: list[int]
+    aggregated_stats: dict
+    consistency_issues: list[dict]
+    overall_assessment: dict
+    model_used: str
+    prompt_version: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True, "protected_namespaces": ()}
+
+
+class BookEvaluationHistoryOut(BaseModel):
+    total: int
+    evaluations: list[BookEvaluationOut]
 
 
 class ParsedChapterPayload(BaseModel):

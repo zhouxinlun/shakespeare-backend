@@ -201,6 +201,7 @@ class _LiveEvaluationResult(BaseModel):
 
 class NovelEvaluator:
     MODEL = "novel_evaluator"
+    DEFAULT_MISSING_SCORE = 6.0
 
     def __init__(self, content_type: str = "short_drama") -> None:
         profile = EVALUATION_PROFILES.get(content_type) or EVALUATION_PROFILES["general"]
@@ -339,13 +340,15 @@ class NovelEvaluator:
         normalized: dict[str, float] = {}
         for dimension in self.dimensions:
             value = raw_scores.get(dimension)
+            meta = self.profile["dimensions"].get(dimension, {})
+            default_score = float(meta.get("default_score", self.DEFAULT_MISSING_SCORE))
             if value is None:
-                normalized[dimension] = 6.0
+                normalized[dimension] = max(1.0, min(10.0, default_score))
                 continue
             try:
                 score = float(value)
             except (TypeError, ValueError):
-                score = 6.0
+                score = default_score
             normalized[dimension] = max(1.0, min(10.0, score))
         return normalized
 

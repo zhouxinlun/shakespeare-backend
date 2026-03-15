@@ -4,6 +4,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from datetime import datetime
 from typing import Optional
 from app.database import Base
+from app.core.time import utc_now_naive
 
 
 class AIConfig(Base):
@@ -26,7 +27,7 @@ class AIConfig(Base):
     image_min_size: Mapped[Optional[str]] = mapped_column(String(20))
     supports_video_generation: Mapped[Optional[bool]] = mapped_column(Boolean)
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
 
 
 class AIModelMap(Base):
@@ -48,7 +49,7 @@ class ProviderBaseURLMap(Base):
     manufacturer: Mapped[str] = mapped_column(String(50))
     base_url_prefix: Mapped[str] = mapped_column(String(500))
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
 
 
 class Prompt(Base):
