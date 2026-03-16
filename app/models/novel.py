@@ -82,3 +82,19 @@ class BookEvaluation(Base):
         default=utc_now_naive,
         onupdate=utc_now_naive,
     )
+
+
+class NovelChatMessage(Base):
+    __tablename__ = "novel_chat_messages"
+    __table_args__ = (
+        Index("idx_novel_chat_messages_project_user_created", "project_id", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    role: Mapped[str] = mapped_column(String(20))
+    message: Mapped[str] = mapped_column(Text)
+    skill: Mapped[Optional[str]] = mapped_column(String(50))
+    selected_novel_ids: Mapped[list] = mapped_column(JSONB, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)

@@ -4,14 +4,15 @@ from types import SimpleNamespace
 from pydantic import ValidationError
 
 from app.schemas.novel import (
+    NovelChatRequest,
     NovelCreate,
-    NovelEvaluateBatchRequest,
     NovelEvaluateBookRequest,
     NovelEvaluateLiveRequest,
     NovelParseRequest,
     NovelUpdate,
 )
 from app.services.novel_book_evaluator import NovelBookEvaluator
+from app.services.novel_chat import recommend_chat_skill
 from app.services.novel_evaluator import NovelEvaluator
 from app.services.novel_parser import NovelParser
 
@@ -41,10 +42,21 @@ class TestNovelSchemaValidation(unittest.TestCase):
             raw_text=" 正文 ",
             rule_type="separator",
             separator_pattern=" --- ",
-            target_platform=" 抖音 ",
+            custom_split_rule=" re:\\n---\\n ",
+            content_genre=" 悬疑 ",
         )
         self.assertEqual(payload.separator_pattern, "---")
-        self.assertEqual(payload.target_platform, "抖音")
+        self.assertEqual(payload.custom_split_rule, "re:\\n---\\n")
+        self.assertEqual(payload.content_genre, "悬疑")
+
+    def test_chat_request_validates_message_and_ids(self):
+        payload = NovelChatRequest(message=" 请评估第1章 ", skill="chapter_eval", novel_ids=[1, 2])
+        self.assertEqual(payload.message, "请评估第1章")
+        self.assertEqual(payload.novel_ids, [1, 2])
+        with self.assertRaises(ValidationError):
+            NovelChatRequest(message="   ")
+        with self.assertRaises(ValidationError):
+            NovelChatRequest(message="ok", novel_ids=[1, 1])
 
     def test_live_request_trims_and_rejects_empty_content(self):
         payload = NovelEvaluateLiveRequest(temporary_content=" 临时正文 ", chapter_title=" 第一章 ")
@@ -52,14 +64,6 @@ class TestNovelSchemaValidation(unittest.TestCase):
         self.assertEqual(payload.chapter_title, "第一章")
         with self.assertRaises(ValidationError):
             NovelEvaluateLiveRequest(temporary_content="   ")
-
-    def test_batch_request_validates_ids(self):
-        payload = NovelEvaluateBatchRequest(novel_ids=[1, 2, 3])
-        self.assertEqual(payload.novel_ids, [1, 2, 3])
-        with self.assertRaises(ValidationError):
-            NovelEvaluateBatchRequest(novel_ids=[])
-        with self.assertRaises(ValidationError):
-            NovelEvaluateBatchRequest(novel_ids=[1, 1])
 
     def test_book_request_validates_optional_lists(self):
         payload = NovelEvaluateBookRequest(
@@ -74,6 +78,23 @@ class TestNovelSchemaValidation(unittest.TestCase):
             NovelEvaluateBookRequest(novel_ids=[1, 1])
         with self.assertRaises(ValidationError):
             NovelEvaluateBookRequest(chapters_to_evaluate=[])
+
+
+class TestNovelChatSkillRecommendation(unittest.TestCase):
+    def test_recommend_rewrite_skill(self):
+        skill, reason = recommend_chat_skill("请把第3章结尾改写得更有悬念")
+        self.assertEqual(skill, "chapter_rewrite")
+        self.assertIn("章节改写", reason or "")
+
+    def test_recommend_character_skill(self):
+        skill, reason = recommend_chat_skill("分析一下主角和反派的人物关系与动机")
+        self.assertEqual(skill, "character_insight")
+        self.assertIn("人物", reason or "")
+
+    def test_recommend_none_for_generic_message(self):
+        skill, reason = recommend_chat_skill("你好，继续")
+        self.assertIsNone(skill)
+        self.assertIsNone(reason)
 
 
 class TestNovelParserRules(unittest.TestCase):
@@ -117,6 +138,40 @@ class TestNovelParserRules(unittest.TestCase):
         chapters = parser._separator_parse(text, separator_pattern="---")  # noqa: SLF001
         self.assertEqual(len(chapters), 3)
         self.assertEqual(chapters[1]["content"], "第二段内容")
+
+    def test_rhythm_rule_parse_splits_short_story_into_multiple_segments(self):
+        parser = NovelParser()
+        base = (
+            "夜里十点，陈默回到旧宅，发现客厅灯亮着，却没人说话。"
+            "他推开书房门，桌上多了一封没有署名的信。"
+            "信里只写着一句：真相在地下室。"
+            "他刚走到楼梯口，手机突然震动，来电显示是三年前去世的母亲。"
+            "电话那头只有呼吸声，然后一句低语：不要下去。"
+            "他迟疑了两秒，还是拧开门把，地下室里传来金属拖动的声音。"
+        )
+        text = base * 4
+        analysis = parser._analyze_text(text=text)  # noqa: SLF001
+        chapters = parser._rhythm_rule_parse(  # noqa: SLF001
+            text,
+            analysis=analysis,
+            twist_strategy="balanced",
+        )
+        self.assertGreaterEqual(len(chapters), 2)
+
+    def test_need_rhythm_fallback_triggered_for_mid_short_text(self):
+        parser = NovelParser()
+        text = (
+            "雨夜里她站在站台尽头，手里攥着那张已经褪色的车票。"
+            "广播突然报出一串陌生数字，她意识到那正是父亲留下的旧密码。"
+            "她追进列车，却在最后一节车厢看见了不该出现的人影。"
+        ) * 8
+        analysis = parser._analyze_text(text=text)  # noqa: SLF001
+        should_fallback = parser._need_rhythm_fallback(  # noqa: SLF001
+            chapters=[{"chapter_index": 1, "chapter_title": "第1章", "content": text}],
+            text=text,
+            analysis=analysis,
+        )
+        self.assertTrue(should_fallback)
 
     def test_assess_quality_rejects_single_candidate(self):
         parser = NovelParser()

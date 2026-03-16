@@ -1,4 +1,3 @@
-import asyncio
 import json
 import re
 from datetime import datetime, timezone
@@ -10,16 +9,18 @@ from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
-from app.database import AsyncSessionLocal, get_db
-from app.models.novel import BookEvaluation, Novel, NovelEvaluation
+from app.database import get_db
+from app.models.novel import BookEvaluation, Novel, NovelChatMessage, NovelEvaluation
 from app.models.project import Project
 from app.models.user import User
 from app.schemas.novel import (
     BookEvaluationHistoryOut,
     BookEvaluationOut,
     NovelBatchCreate,
+    NovelChatHistoryOut,
+    NovelChatMessageOut,
+    NovelChatRequest,
     NovelEvaluateBookRequest,
-    NovelEvaluateBatchRequest,
     NovelEvaluationOut,
     NovelEvaluateLiveRequest,
     NovelLatestEvaluationOut,
@@ -30,12 +31,55 @@ from app.schemas.novel import (
     NovelUpdate,
 )
 from app.services.novel_book_evaluator import NovelBookEvaluator
+from app.services.novel_chat import recommend_chat_skill
 from app.services.novel_evaluator import get_evaluator_by_content_type
+from app.services.llm import call_llm_stream
 from app.services.novel_parser import NovelParser
 
 router = APIRouter(tags=["novel"])
 novel_router = APIRouter(prefix="/projects/{project_id}/novels", tags=["novel"])
-BATCH_EVALUATION_MAX_CONCURRENCY = 3
+NOVEL_CHAT_SKILL_HINTS = {
+    "chapter_eval": "按章节做精准评估，给出问题定位、分数解释和优先级建议。",
+    "chapter_rewrite": "按用户目标改写指定章节，保持人设与主线一致，给出可直接替换的文本。",
+    "story_overview": "提炼全书主线、分集节奏和结构风险，给出下一步优化路线。",
+    "character_insight": "分析人物关系、动机和成长线，指出冲突与反转机会。",
+    "platform_advice": "结合短剧发布平台给出内容包装、标题和节奏优化建议。",
+}
+NOVEL_CHAT_SKILL_PROMPTS = {
+    "chapter_eval": (
+        "你在本轮按章节评估模式工作。请优先给出："
+        "1) 问题定位（引用章节号）"
+        "2) 原因分析"
+        "3) 可执行修改动作（按优先级 high/medium/low）。"
+    ),
+    "chapter_rewrite": (
+        "你在本轮按章节改写模式工作。请按“改写意图 -> 可替换正文 -> 修改说明”输出，"
+        "并保持人物设定、叙事视角和主线因果不漂移。"
+    ),
+    "story_overview": (
+        "你在本轮全书梳理模式工作。请给出“主线摘要 -> 分集节奏 -> 结构风险 -> 下一步优化路线”，"
+        "并明确建议应落到哪些章节。"
+    ),
+    "character_insight": (
+        "你在本轮人物分析模式工作。请输出“角色目标/阻碍/转变 -> 关系张力 -> 可做冲突与反转点”，"
+        "避免泛泛分析。"
+    ),
+    "platform_advice": (
+        "你在本轮平台建议模式工作。请结合内容类型与当前文本，给出“目标平台画像 -> 标题包装 -> 开篇节奏优化"
+        " -> 分集长度/挂念建议”。"
+    ),
+}
+NOVEL_CHAT_HISTORY_LIMIT = 12
+
+NOVEL_CHAT_SYSTEM_PROMPT = """你是小说改编与内容诊断顾问，目标是帮助用户高效改进当前项目的章节。
+
+输出要求：
+1. 回答必须可执行，优先给具体章节、具体改法、具体理由。
+2. 涉及“评估”时，请按“问题 -> 原因 -> 建议”格式组织。
+3. 涉及“改写”时，请直接给可替换正文，并说明改写意图。
+4. 当用户选择了章节范围，只围绕这些章节回答；若未指定，则可先概览再给聚焦建议。
+5. 不编造不存在的章节内容；信息不足时明确说明并给下一步输入建议。
+"""
 
 
 def _count_words(text: str) -> int:
@@ -43,19 +87,20 @@ def _count_words(text: str) -> int:
     return len(compact)
 
 
-async def _evaluate_with_isolated_session(
-    *,
-    evaluator,
-    novel: Novel,
-    user_id: int,
-) -> tuple[dict, list[dict]]:
-    # AsyncSession is not safe for concurrent awaits; each evaluation task gets its own session.
-    async with AsyncSessionLocal() as isolated_db:
-        return await evaluator.evaluate_single(
-            novel=novel,
-            db=isolated_db,
-            user_id=user_id,
-        )
+def _serialize_chat_message(message: NovelChatMessage) -> NovelChatMessageOut:
+    role = message.role if message.role in {"user", "assistant"} else "assistant"
+    skill = message.skill if message.skill in NOVEL_CHAT_SKILL_HINTS else None
+    novel_ids = message.selected_novel_ids or []
+    if not isinstance(novel_ids, list):
+        novel_ids = []
+    return NovelChatMessageOut(
+        id=message.id,
+        role=role,
+        message=message.message,
+        skill=skill,
+        novel_ids=[int(item) for item in novel_ids if isinstance(item, int)],
+        created_at=message.created_at,
+    )
 
 
 async def _get_user_project(project_id: int, user: User, db: AsyncSession) -> Project:
@@ -329,6 +374,200 @@ async def parse_novel(
     return _stream_response(stream())
 
 
+@novel_router.get("/chat/history", response_model=NovelChatHistoryOut)
+async def list_chat_history(
+    project_id: int,
+    limit: int = 80,
+    offset: int = 0,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_user_project(project_id, user, db)
+
+    if limit <= 0 or limit > 200:
+        raise HTTPException(status_code=400, detail="limit 取值范围为 1-200")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset 不能小于 0")
+
+    total = await db.scalar(
+        select(func.count(NovelChatMessage.id)).where(
+            NovelChatMessage.project_id == project_id,
+            NovelChatMessage.user_id == user.id,
+        )
+    )
+    result = await db.execute(
+        select(NovelChatMessage)
+        .where(
+            NovelChatMessage.project_id == project_id,
+            NovelChatMessage.user_id == user.id,
+        )
+        .order_by(NovelChatMessage.created_at.desc(), NovelChatMessage.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = list(reversed(result.scalars().all()))
+    return NovelChatHistoryOut(
+        total=int(total or 0),
+        messages=[_serialize_chat_message(item) for item in rows],
+    )
+
+
+@novel_router.delete("/chat/history")
+async def clear_chat_history(
+    project_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_user_project(project_id, user, db)
+    await db.execute(
+        delete(NovelChatMessage).where(
+            NovelChatMessage.project_id == project_id,
+            NovelChatMessage.user_id == user.id,
+        )
+    )
+    await db.commit()
+    return {"code": 0, "msg": "小说 Chat 历史已清空"}
+
+
+@novel_router.post("/chat")
+async def chat_novel(
+    project_id: int,
+    body: NovelChatRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await _get_user_project(project_id, user, db)
+
+    result = await db.execute(
+        select(Novel).where(Novel.project_id == project_id).order_by(Novel.chapter_index)
+    )
+    novels = result.scalars().all()
+    if not novels:
+        raise HTTPException(status_code=400, detail="当前项目暂无章节，无法进行小说 Chat")
+
+    selected_novels = novels
+    selected_novel_ids = body.novel_ids or []
+    if body.novel_ids:
+        selected_ids = set(body.novel_ids)
+        selected_novels = [item for item in novels if item.id in selected_ids]
+        if len(selected_novels) != len(selected_ids):
+            raise HTTPException(status_code=404, detail="novel_ids 中存在无效章节")
+
+    recent_chat_result = await db.execute(
+        select(NovelChatMessage)
+        .where(
+            NovelChatMessage.project_id == project_id,
+            NovelChatMessage.user_id == user.id,
+        )
+        .order_by(NovelChatMessage.created_at.desc(), NovelChatMessage.id.desc())
+        .limit(NOVEL_CHAT_HISTORY_LIMIT)
+    )
+    recent_chat_rows = list(reversed(recent_chat_result.scalars().all()))
+    history_messages = [
+        {"role": item.role, "content": item.message}
+        for item in recent_chat_rows
+        if item.role in {"user", "assistant"} and (item.message or "").strip()
+    ]
+
+    effective_skill = body.skill
+    recommended_reason: str | None = None
+    if not effective_skill:
+        effective_skill, recommended_reason = recommend_chat_skill(body.message)
+
+    chapter_lines = [
+        f"- 第{item.chapter_index}章《{item.chapter_title or f'第{item.chapter_index}章'}》"
+        f"（ID:{item.id}，{int(item.word_count or 0)}字）"
+        for item in novels
+    ]
+    selected_preview = "\n".join(
+        [
+            f"### 第{item.chapter_index}章《{item.chapter_title or f'第{item.chapter_index}章'}》\n"
+            f"{(item.content or '').strip()[:1800]}"
+            for item in selected_novels[:6]
+        ]
+    )
+    skill_hint = NOVEL_CHAT_SKILL_HINTS.get(effective_skill or "")
+    skill_prompt = NOVEL_CHAT_SKILL_PROMPTS.get(effective_skill or "")
+    evaluation_briefs = []
+    for item in selected_novels[:8]:
+        latest = await _get_latest_evaluation(item.id, project_id, db)
+        if not latest:
+            continue
+        evaluation_briefs.append(
+            f"- 第{item.chapter_index}章：总分{round(float(latest.overall_score), 2)}，"
+            f"关键建议数 {len(latest.suggestions or [])}"
+        )
+
+    system_parts = [
+        NOVEL_CHAT_SYSTEM_PROMPT.strip(),
+        f"当前项目内容类型：{project.content_type}",
+        f"全书章节数：{len(novels)}",
+        "全书章节索引：\n" + "\n".join(chapter_lines[:60]),
+        f"当前会话聚焦章节 ID：{selected_novel_ids or '未指定（全书视角）'}",
+        "聚焦章节正文（节选）：\n" + (selected_preview or "无"),
+    ]
+    if skill_hint:
+        system_parts.append(f"本次技能目标：{skill_hint}")
+    if skill_prompt:
+        system_parts.append(f"技能执行要求：{skill_prompt}")
+    if evaluation_briefs:
+        system_parts.append("聚焦章节已有评估摘要：\n" + "\n".join(evaluation_briefs))
+
+    async def stream():
+        user_record = NovelChatMessage(
+            project_id=project_id,
+            user_id=user.id,
+            role="user",
+            message=body.message,
+            skill=effective_skill,
+            selected_novel_ids=selected_novel_ids,
+        )
+        db.add(user_record)
+        await db.flush()
+        await db.commit()
+
+        if recommended_reason and effective_skill:
+            yield {
+                "type": "skill_recommendation",
+                "recommended_skill": effective_skill,
+                "reason": recommended_reason,
+            }
+        yield {"type": "progress", "message": "正在分析你的请求...", "progress": 8}
+        assistant_chunks: list[str] = []
+        async for item in call_llm_stream(
+            messages=[*history_messages, {"role": "user", "content": body.message}],
+            config_key="novel_evaluator",
+            db=db,
+            user_id=user.id,
+            system_prompt="\n\n".join(system_parts),
+        ):
+            if isinstance(item, dict) and item.get("type") == "fallback_warning":
+                yield item
+                continue
+            chunk = str(item or "")
+            if not chunk:
+                continue
+            assistant_chunks.append(chunk)
+            yield {"type": "content", "data": {"chunk": chunk}}
+
+        assistant_message = "".join(assistant_chunks).strip()
+        if assistant_message:
+            assistant_record = NovelChatMessage(
+                project_id=project_id,
+                user_id=user.id,
+                role="assistant",
+                message=assistant_message,
+                skill=effective_skill,
+                selected_novel_ids=selected_novel_ids,
+            )
+            db.add(assistant_record)
+            await db.flush()
+            await db.commit()
+        yield {"type": "done", "message": "已完成本轮小说 Chat", "skill": effective_skill}
+
+    return _stream_response(stream())
+
+
 @novel_router.post("/{novel_id}/evaluate-live")
 async def evaluate_novel_live(
     project_id: int,
@@ -364,208 +603,6 @@ async def evaluate_novel_live(
     }
 
 
-@novel_router.post("/evaluate-all")
-async def evaluate_all_novels(
-    project_id: int,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    project = await _get_user_project(project_id, user, db)
-    evaluator = get_evaluator_by_content_type(project.content_type)
-
-    result = await db.execute(
-        select(Novel).where(Novel.project_id == project_id).order_by(Novel.chapter_index)
-    )
-    novels = result.scalars().all()
-
-    async def stream():
-        if not novels:
-            yield {"type": "error", "message": "当前项目没有章节可评估"}
-            return
-
-        chapter_scores: list[tuple[int, float]] = []
-        for idx, novel in enumerate(novels, start=1):
-            title = novel.chapter_title or f"第{novel.chapter_index}章"
-            yield {
-                "type": "chapter_start",
-                "novel_id": novel.id,
-                "chapter_title": title,
-                "index": idx,
-                "total": len(novels),
-            }
-            try:
-                evaluation_data, fallback_events = await evaluator.evaluate_single(
-                    novel=novel,
-                    db=db,
-                    user_id=user.id,
-                )
-            except Exception as exc:
-                yield {
-                    "type": "chapter_done",
-                    "novel_id": novel.id,
-                    "chapter_title": title,
-                    "error": str(exc),
-                }
-                continue
-
-            for event in fallback_events:
-                yield event
-
-            previous = await _get_latest_evaluation(novel.id, project_id, db)
-            evaluation = _build_evaluation_record(
-                novel=novel,
-                project=project,
-                evaluation_data=evaluation_data,
-                previous=previous,
-            )
-            db.add(evaluation)
-            await db.flush()
-
-            chapter_scores.append((novel.id, evaluation_data["overall_score"]))
-            yield {
-                "type": "chapter_done",
-                "novel_id": novel.id,
-                "chapter_title": title,
-                "overall_score": evaluation_data["overall_score"],
-            }
-
-        await db.commit()
-
-        if not chapter_scores:
-            yield {"type": "done", "avg_score": None, "best_chapter": None, "weakest_chapter": None}
-            return
-
-        avg_score = round(sum(score for _, score in chapter_scores) / len(chapter_scores), 2)
-        best_chapter = max(chapter_scores, key=lambda x: x[1])[0]
-        weakest_chapter = min(chapter_scores, key=lambda x: x[1])[0]
-
-        yield {
-            "type": "done",
-            "avg_score": avg_score,
-            "best_chapter": best_chapter,
-            "weakest_chapter": weakest_chapter,
-        }
-
-    return _stream_response(stream())
-
-
-@novel_router.post("/evaluate-batch")
-async def evaluate_batch_novels(
-    project_id: int,
-    body: NovelEvaluateBatchRequest,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    project = await _get_user_project(project_id, user, db)
-    evaluator = get_evaluator_by_content_type(project.content_type)
-
-    result = await db.execute(
-        select(Novel)
-        .where(Novel.project_id == project_id, Novel.id.in_(body.novel_ids))
-        .order_by(Novel.chapter_index)
-    )
-    novels = result.scalars().all()
-    if len(novels) != len(body.novel_ids):
-        raise HTTPException(status_code=404, detail="存在无效章节 ID")
-
-    async def stream():
-        results: list[dict] = []
-        semaphore = asyncio.Semaphore(BATCH_EVALUATION_MAX_CONCURRENCY)
-
-        async def run_one(novel: Novel) -> dict:
-            title = novel.chapter_title or f"第{novel.chapter_index}章"
-            async with semaphore:
-                try:
-                    evaluation_data, fallback_events = await _evaluate_with_isolated_session(
-                        evaluator=evaluator,
-                        novel=novel,
-                        user_id=user.id,
-                    )
-                    return {
-                        "novel": novel,
-                        "title": title,
-                        "evaluation_data": evaluation_data,
-                        "fallback_events": fallback_events,
-                    }
-                except Exception as exc:
-                    return {
-                        "novel": novel,
-                        "title": title,
-                        "error": str(exc),
-                    }
-
-        tasks = [asyncio.create_task(run_one(novel)) for novel in novels]
-        completed = 0
-
-        try:
-            for done_task in asyncio.as_completed(tasks):
-                payload = await done_task
-                novel = payload["novel"]
-                title = payload["title"]
-                completed += 1
-
-                yield {
-                    "type": "progress",
-                    "status": "processing",
-                    "current": completed,
-                    "total": len(novels),
-                    "novel_id": novel.id,
-                    "chapter": title,
-                }
-
-                if payload.get("error"):
-                    results.append(
-                        {
-                            "_chapter_index": novel.chapter_index,
-                            "novel_id": novel.id,
-                            "chapter_title": title,
-                            "error": payload["error"],
-                        }
-                    )
-                    continue
-
-                for event in payload.get("fallback_events") or []:
-                    yield event
-
-                previous = await _get_latest_evaluation(novel.id, project_id, db)
-                evaluation = _build_evaluation_record(
-                    novel=novel,
-                    project=project,
-                    evaluation_data=payload["evaluation_data"],
-                    previous=previous,
-                )
-                db.add(evaluation)
-                await db.flush()
-
-                results.append(
-                    {
-                        "_chapter_index": novel.chapter_index,
-                        "novel_id": novel.id,
-                        "chapter_title": title,
-                        "overall_score": evaluation.overall_score,
-                        "evaluation": _serialize_evaluation(evaluation),
-                    }
-                )
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-        await db.commit()
-        results.sort(key=lambda item: int(item.get("_chapter_index", 0)))
-        for item in results:
-            item.pop("_chapter_index", None)
-        yield {
-            "type": "complete",
-            "total": len(novels),
-            "results": results,
-        }
-
-    return _stream_response(stream())
-
-
 @novel_router.post("/evaluate-book", response_model=BookEvaluationOut)
 async def evaluate_book(
     project_id: int,
@@ -574,7 +611,6 @@ async def evaluate_book(
     db: AsyncSession = Depends(get_db),
 ):
     project = await _get_user_project(project_id, user, db)
-    evaluator = get_evaluator_by_content_type(project.content_type)
 
     result = await db.execute(
         select(Novel).where(Novel.project_id == project_id).order_by(Novel.chapter_index)
@@ -599,37 +635,26 @@ async def evaluate_book(
     else:
         selected_novels = novels
 
+    if body.force_re_evaluate:
+        raise HTTPException(status_code=400, detail="已取消自动重评，请先逐章评估后再生成全书仪表盘")
+
     latest_map: dict[int, NovelEvaluation] = {}
+    missing_chapters: list[int] = []
     for novel in selected_novels:
         latest = await _get_latest_evaluation(novel.id, project_id, db)
-        if body.force_re_evaluate or not latest:
-            try:
-                evaluation_data, _ = await evaluator.evaluate_single(
-                    novel=novel,
-                    db=db,
-                    user_id=user.id,
-                )
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"章节评估失败（第{novel.chapter_index}章）: {exc}",
-                ) from exc
-
-            evaluation = _build_evaluation_record(
-                novel=novel,
-                project=project,
-                evaluation_data=evaluation_data,
-                previous=latest,
-            )
-            db.add(evaluation)
-            await db.flush()
-            latest = evaluation
         if latest:
             latest_map[novel.id] = latest
+        else:
+            missing_chapters.append(novel.chapter_index)
 
-    selected_evaluations = [latest_map[item.id] for item in selected_novels if item.id in latest_map]
-    if len(selected_evaluations) != len(selected_novels):
-        raise HTTPException(status_code=500, detail="部分章节缺少评估结果，请先执行章节评估")
+    if missing_chapters:
+        chapter_list = "、".join([f"第{idx}章" for idx in sorted(missing_chapters)])
+        raise HTTPException(
+            status_code=400,
+            detail=f"以下章节缺少评估结果，请先完成章节评估：{chapter_list}",
+        )
+
+    selected_evaluations = [latest_map[item.id] for item in selected_novels]
 
     book_evaluator = NovelBookEvaluator(content_type=project.content_type)
     report = book_evaluator.build_report(
@@ -710,66 +735,6 @@ async def list_novel_evaluations(
         .order_by(NovelEvaluation.created_at.desc(), NovelEvaluation.id.desc())
     )
     return result.scalars().all()
-
-
-@novel_router.get("/{novel_id}/evaluations/compare")
-async def compare_novel_evaluations(
-    project_id: int,
-    novel_id: int,
-    version1: int,
-    version2: int,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    await _get_user_project(project_id, user, db)
-
-    def _normalize_suggestion_dimensions(raw_suggestions: list) -> set[str]:
-        dimensions: set[str] = set()
-        for item in raw_suggestions or []:
-            if isinstance(item, dict):
-                dim = str(item.get("dimension") or "").strip()
-                if dim:
-                    dimensions.add(dim)
-        return dimensions
-
-    result = await db.execute(
-        select(NovelEvaluation).where(
-            NovelEvaluation.project_id == project_id,
-            NovelEvaluation.novel_id == novel_id,
-            NovelEvaluation.id.in_([version1, version2]),
-        )
-    )
-    rows = result.scalars().all()
-    if len(rows) != 2:
-        raise HTTPException(status_code=404, detail="评估版本不存在")
-
-    by_id = {item.id: item for item in rows}
-    eval1 = by_id.get(version1)
-    eval2 = by_id.get(version2)
-    if not eval1 or not eval2:
-        raise HTTPException(status_code=404, detail="评估版本不存在")
-
-    all_dimensions = set((eval1.dimension_scores or {}).keys()) | set((eval2.dimension_scores or {}).keys())
-    comparison: dict[str, dict] = {}
-    for key in sorted(all_dimensions):
-        before = float((eval1.dimension_scores or {}).get(key, 0))
-        after = float((eval2.dimension_scores or {}).get(key, 0))
-        comparison[key] = {
-            "before": round(before, 2),
-            "after": round(after, 2),
-            "delta": round(after - before, 2),
-        }
-
-    dim1 = _normalize_suggestion_dimensions(eval1.suggestions)
-    dim2 = _normalize_suggestion_dimensions(eval2.suggestions)
-
-    return {
-        "version1": _serialize_evaluation(eval1),
-        "version2": _serialize_evaluation(eval2),
-        "comparison": comparison,
-        "suggestions_resolved": len(dim1 - dim2),
-        "new_issues": len(dim2 - dim1),
-    }
 
 
 @novel_router.post("/{novel_id}/evaluate")

@@ -115,7 +115,19 @@ class NovelParser:
             return
 
         options = options or {}
-        rule_type = options.get("rule_type") or "title"
+        parse_path = options.get("parse_path")
+        legacy_rule_type = options.get("rule_type")
+        if parse_path not in {"guided_rule", "intelligent"}:
+            parse_path = "intelligent" if legacy_rule_type == "rhythm" else "guided_rule"
+
+        rule_type = legacy_rule_type
+        if parse_path == "guided_rule":
+            if rule_type not in {"title", "separator", "custom"}:
+                rule_type = "title"
+        else:
+            # 智能分集以 AI 节奏拆分为主，不再暴露 rhythm 规则型分支
+            rule_type = "title"
+
         analysis = self._analyze_text(text=text, separator_pattern=options.get("separator_pattern"))
 
         yield {"type": "progress", "message": "正在分析文本结构...", "progress": 10}
@@ -125,109 +137,147 @@ class NovelParser:
         fallback_events: list[dict] = []
         parsing_method = "rule_only"
         confidence = 0.7
-        parser_prompt = self._build_parser_system_prompt(options=options, analysis=analysis)
+        parser_prompt = self._build_parser_system_prompt(
+            options=options,
+            analysis=analysis,
+            parse_path=parse_path,
+            rule_type=rule_type,
+        )
 
-        if rule_type == "separator":
-            yield {"type": "progress", "message": "正在按分隔标记拆分文本...", "progress": 22}
-            chapters = self._separator_parse(text, separator_pattern=options.get("separator_pattern"))
-            if chapters:
-                parsing_method = "separator_rule"
-                confidence = 0.88
-                yield {"type": "progress", "message": "分隔标记解析完成", "progress": 60}
-            elif mode == "rule_only":
-                yield {"type": "progress", "message": "未识别到有效分隔标记，已回退为规则解析", "progress": 28}
+        if parse_path == "guided_rule":
+            if rule_type == "separator":
+                yield {"type": "progress", "message": "正在按分隔标记拆分文本...", "progress": 22}
+                chapters = self._separator_parse(text, separator_pattern=options.get("separator_pattern"))
+                if chapters:
+                    parsing_method = "separator_rule"
+                    confidence = 0.9
+                    yield {"type": "progress", "message": "分隔标记解析完成", "progress": 60}
+                elif mode == "rule_only":
+                    yield {"type": "progress", "message": "未识别到有效分隔标记，已回退为规则解析", "progress": 28}
+            elif rule_type == "custom":
+                yield {"type": "progress", "message": "正在按自定义规则拆分文本...", "progress": 22}
+                chapters = self._custom_rule_parse(text, custom_rule=options.get("custom_split_rule"))
+                if chapters:
+                    parsing_method = "custom_rule"
+                    confidence = 0.9
+                    yield {"type": "progress", "message": "自定义规则解析完成", "progress": 60}
+                elif mode == "rule_only":
+                    yield {"type": "progress", "message": "自定义规则未命中，已回退为规则解析", "progress": 28}
 
-        if rule_type == "rhythm" and mode != "rule_only" and not chapters:
-            yield {"type": "progress", "message": "正在按转折点和节奏设计拆分...", "progress": 24}
-            async for event in self._ai_parse(
-                text=text,
-                db=db,
-                user_id=user_id,
-                progress_from=28,
-                progress_to=58,
-                system_prompt=parser_prompt,
-            ):
-                if event["type"] == "_ai_parse_result":
-                    chapters = event["chapters"]
+            if mode == "rule_only" and not chapters:
+                chapters = self._rule_parse(text, allow_paragraph_fallback=True)
+                yield {"type": "progress", "message": "规则解析完成", "progress": 60}
+            elif mode == "ai_only" and not chapters:
+                async for event in self._ai_parse(
+                    text=text,
+                    db=db,
+                    user_id=user_id,
+                    progress_from=20,
+                    progress_to=58,
+                    system_prompt=parser_prompt,
+                ):
+                    if event["type"] == "_ai_parse_result":
+                        chapters = event["chapters"]
+                    else:
+                        yield event
+                parsing_method = "ai_full"
+                confidence = 0.9
+                yield {"type": "progress", "message": "AI 解析完成", "progress": 60}
+                if not chapters:
+                    chapters = self._rule_parse(text, allow_paragraph_fallback=True)
+                    parsing_method = "rule_fallback"
+                    confidence = 0.45
+                    yield {"type": "progress", "message": "AI 未返回结果，已回退到规则解析", "progress": 65}
+            elif not chapters:
+                rough = self._rule_parse(text, allow_paragraph_fallback=False)
+                quality = self._assess_quality(rough)
+                yield {
+                    "type": "progress",
+                    "message": f"规则预处理识别到 {len(rough)} 个候选章节，质量评估为 {quality}...",
+                    "progress": 35,
+                }
+                if quality == "good":
+                    chapters = rough
+                    parsing_method = "rule_only"
+                    confidence = 0.95
+                    yield {"type": "progress", "message": "章节标记清晰，采用规则解析结果", "progress": 65}
                 else:
-                    yield event
-            parsing_method = "rhythm_ai"
-            confidence = 0.86
-            if chapters:
-                yield {"type": "progress", "message": "节奏优先解析完成", "progress": 60}
+                    if quality == "partial":
+                        chapters, fallback_events = await self._ai_refine(rough_chunks=rough, db=db, user_id=user_id)
+                        parsing_method = "ai_enhance"
+                        confidence = 0.72
+                        if chapters:
+                            yield {"type": "progress", "message": "AI 解析完成", "progress": 65}
 
-        if mode == "rule_only" and not chapters:
-            chapters = self._rule_parse(text, allow_paragraph_fallback=True)
-            yield {"type": "progress", "message": "规则解析完成", "progress": 60}
-        elif mode == "ai_only" and not chapters:
-            async for event in self._ai_parse(
-                text=text,
-                db=db,
-                user_id=user_id,
-                progress_from=20,
-                progress_to=58,
-                system_prompt=parser_prompt,
-            ):
-                if event["type"] == "_ai_parse_result":
-                    chapters = event["chapters"]
-                else:
-                    yield event
-            parsing_method = "ai_full"
-            confidence = 0.92
-            yield {"type": "progress", "message": "AI 解析完成", "progress": 60}
+                    if not chapters:
+                        async for event in self._ai_parse(
+                            text=text,
+                            db=db,
+                            user_id=user_id,
+                            progress_from=42,
+                            progress_to=58,
+                            system_prompt=parser_prompt,
+                        ):
+                            if event["type"] == "_ai_parse_result":
+                                chapters = event["chapters"]
+                            else:
+                                yield event
+                        parsing_method = "ai_full"
+                        confidence = 0.88
+                        if chapters:
+                            yield {"type": "progress", "message": "AI 解析完成", "progress": 65}
+
+                    if not chapters:
+                        chapters = rough or self._rule_parse(text, allow_paragraph_fallback=True)
+                        parsing_method = "rule_fallback"
+                        confidence = 0.4
+                        yield {"type": "progress", "message": "AI 未返回可用结果，采用规则回退结果", "progress": 65}
+        else:
+            if mode == "rule_only":
+                chapters = self._rhythm_rule_parse(
+                    text,
+                    analysis=analysis,
+                    twist_strategy=options.get("twist_strategy"),
+                )
+                parsing_method = "rhythm_rule"
+                confidence = 0.72
+                yield {"type": "progress", "message": "按剧情起伏规则拆分完成", "progress": 60}
+            else:
+                yield {"type": "progress", "message": "正在按转折点和挂念策略进行智能分集...", "progress": 24}
+                async for event in self._ai_parse(
+                    text=text,
+                    db=db,
+                    user_id=user_id,
+                    progress_from=28,
+                    progress_to=58,
+                    system_prompt=parser_prompt,
+                ):
+                    if event["type"] == "_ai_parse_result":
+                        chapters = event["chapters"]
+                    else:
+                        yield event
+                parsing_method = "rhythm_ai"
+                confidence = 0.86
+                if chapters:
+                    yield {"type": "progress", "message": "智能分集完成", "progress": 60}
+
+            if self._need_rhythm_fallback(chapters=chapters, text=text, analysis=analysis):
+                rhythm_chapters = self._rhythm_rule_parse(
+                    text,
+                    analysis=analysis,
+                    twist_strategy=options.get("twist_strategy"),
+                )
+                if len(rhythm_chapters) >= 2:
+                    chapters = rhythm_chapters
+                    parsing_method = "rhythm_rule"
+                    confidence = 0.78
+                    yield {"type": "progress", "message": "检测到单段分集，已按剧情起伏自动细分", "progress": 64}
+
             if not chapters:
                 chapters = self._rule_parse(text, allow_paragraph_fallback=True)
                 parsing_method = "rule_fallback"
                 confidence = 0.45
-                yield {"type": "progress", "message": "AI 未返回结果，已回退到规则解析", "progress": 65}
-        elif not chapters:
-            rough = self._rule_parse(text, allow_paragraph_fallback=False)
-            quality = self._assess_quality(rough)
-            yield {
-                "type": "progress",
-                "message": f"规则预处理识别到 {len(rough)} 个候选章节，质量评估为 {quality}...",
-                "progress": 35,
-            }
-            if quality == "good":
-                chapters = rough
-                parsing_method = "rule_only"
-                confidence = 0.95
-                yield {"type": "progress", "message": "章节标记清晰，采用规则解析结果", "progress": 65}
-            else:
-                # For partial quality, try AI refine first (cheaper, has rough chunks)
-                # Then fall back to AI parse on raw text
-                if quality == "partial":
-                    chapters, fallback_events = await self._ai_refine(rough_chunks=rough, db=db, user_id=user_id)
-                    parsing_method = "ai_enhance"
-                    confidence = 0.72
-                    if chapters:
-                        yield {"type": "progress", "message": "AI 解析完成", "progress": 65}
-
-                # If refine returned empty or quality was "none", try full AI parse
-                if not chapters:
-                    async for event in self._ai_parse(
-                        text=text,
-                        db=db,
-                        user_id=user_id,
-                        progress_from=42,
-                        progress_to=58,
-                        system_prompt=parser_prompt,
-                    ):
-                        if event["type"] == "_ai_parse_result":
-                            chapters = event["chapters"]
-                        else:
-                            yield event
-                    parsing_method = "ai_full"
-                    confidence = 0.9 if quality == "partial" else 0.88
-                    if chapters:
-                        yield {"type": "progress", "message": "AI 解析完成", "progress": 65}
-
-                # Final fallback to rule parse
-                if not chapters:
-                    chapters = rough or self._rule_parse(text, allow_paragraph_fallback=True)
-                    parsing_method = "rule_fallback"
-                    confidence = 0.4
-                    yield {"type": "progress", "message": "AI 未返回可用结果，采用规则回退结果", "progress": 65}
+                yield {"type": "progress", "message": "智能分集未返回结果，已回退为规则解析", "progress": 65}
 
         for event in fallback_events:
             yield event
@@ -389,6 +439,184 @@ class NovelParser:
             }
             for index, chunk in enumerate(chunks, start=1)
         ]
+
+    def _custom_rule_parse(self, text: str, *, custom_rule: Optional[str]) -> list[dict]:
+        rule = (custom_rule or "").strip()
+        if not rule:
+            return []
+
+        if rule.startswith("re:"):
+            pattern = rule[3:].strip()
+            if not pattern:
+                return []
+            try:
+                regex = re.compile(pattern)
+            except re.error:
+                return []
+            chunks = [part.strip() for part in re.split(regex, text) if part.strip()]
+        else:
+            chunks = []
+            buffer: list[str] = []
+            for raw_line in text.split("\n"):
+                if raw_line.strip() == rule:
+                    content = "\n".join(buffer).strip()
+                    if content:
+                        chunks.append(content)
+                    buffer = []
+                    continue
+                buffer.append(raw_line)
+            content = "\n".join(buffer).strip()
+            if content:
+                chunks.append(content)
+
+        if len(chunks) < 2:
+            return []
+
+        return [
+            {
+                "volume": "正文",
+                "chapter_index": index,
+                "chapter_title": f"第{index}章",
+                "content": chunk,
+            }
+            for index, chunk in enumerate(chunks, start=1)
+        ]
+
+    def _need_rhythm_fallback(self, *, chapters: list[dict], text: str, analysis: dict) -> bool:
+        if len(chapters) >= 2:
+            return False
+        total_chars = self._compact_len(text)
+        if total_chars < 500:
+            return False
+        paragraphs = int(analysis.get("paragraphs", 0) or 0)
+        twist_markers = int(analysis.get("twist_marker_count", 0) or 0)
+        # 短篇智能分集场景中，单段结果往往不符合短剧观看节奏，适当前置回退拆分。
+        return total_chars >= 800 or paragraphs >= 3 or twist_markers >= 1
+
+    def _rhythm_rule_parse(
+        self,
+        text: str,
+        *,
+        analysis: Optional[dict] = None,
+        twist_strategy: Optional[str] = None,
+    ) -> list[dict]:
+        compact_text = self._compact_len(text)
+        if compact_text < 400:
+            return []
+
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+        if len(paragraphs) < 2:
+            paragraphs = [p.strip() for p in self._split_sentences(text) if p.strip()]
+        if len(paragraphs) < 2:
+            return []
+
+        twist_count = int((analysis or {}).get("twist_marker_count", 0) or 0)
+        target_count = self._estimate_rhythm_target_count(
+            total_chars=compact_text,
+            paragraph_count=len(paragraphs),
+            twist_count=twist_count,
+            twist_strategy=twist_strategy,
+        )
+        if target_count < 2:
+            return []
+
+        target_chunk_size = max(260, int(compact_text / target_count))
+        min_chunk_size = max(180, int(target_chunk_size * 0.6))
+        max_chunk_size = int(target_chunk_size * 1.4)
+
+        chunks: list[str] = []
+        buffer: list[str] = []
+        buffer_size = 0
+
+        for idx, paragraph in enumerate(paragraphs):
+            para_text = paragraph.strip()
+            if not para_text:
+                continue
+            para_size = self._compact_len(para_text)
+            buffer.append(para_text)
+            buffer_size += para_size
+
+            is_last = idx == len(paragraphs) - 1
+            next_para = paragraphs[idx + 1] if not is_last else ""
+            has_twist_signal = any(marker in para_text for marker in TWIST_MARKERS)
+            next_has_twist_signal = any(marker in next_para for marker in TWIST_MARKERS)
+
+            if is_last:
+                continue
+            if buffer_size < min_chunk_size:
+                continue
+
+            should_split = False
+            if buffer_size >= target_chunk_size and has_twist_signal:
+                should_split = True
+            elif buffer_size >= max_chunk_size:
+                should_split = True
+            elif has_twist_signal and not next_has_twist_signal and buffer_size >= min_chunk_size:
+                should_split = True
+
+            if should_split:
+                chunks.append("\n\n".join(buffer).strip())
+                buffer = []
+                buffer_size = 0
+
+        if buffer:
+            chunks.append("\n\n".join(buffer).strip())
+
+        chunks = [chunk for chunk in chunks if chunk]
+        if len(chunks) < 2:
+            return []
+
+        if len(chunks) > 12:
+            chunks = chunks[:12]
+
+        tail_size = self._compact_len(chunks[-1])
+        if len(chunks) >= 2 and tail_size < 120:
+            chunks[-2] = f"{chunks[-2]}\n\n{chunks[-1]}".strip()
+            chunks = chunks[:-1]
+
+        return [
+            {
+                "volume": "正文",
+                "chapter_index": index,
+                "chapter_title": f"第{index}章",
+                "content": chunk,
+            }
+            for index, chunk in enumerate(chunks, start=1)
+        ]
+
+    def _estimate_rhythm_target_count(
+        self,
+        *,
+        total_chars: int,
+        paragraph_count: int,
+        twist_count: int,
+        twist_strategy: Optional[str],
+    ) -> int:
+        if total_chars < 1200:
+            base = 2
+        elif total_chars < 2600:
+            base = 3
+        elif total_chars < 4200:
+            base = 4
+        else:
+            base = 5
+
+        if twist_count >= 8:
+            base += 2
+        elif twist_count >= 4:
+            base += 1
+
+        if twist_strategy == "aggressive":
+            base += 1
+        elif twist_strategy == "conservative":
+            base -= 1
+
+        base = max(2, min(base, max(2, paragraph_count)))
+        return min(base, 12)
+
+    def _split_sentences(self, text: str) -> list[str]:
+        sentence_parts = re.split(r"(?<=[。！？!?；;])\s*", text)
+        return [part.strip() for part in sentence_parts if part.strip()]
 
     async def _ai_parse(
         self,
@@ -553,8 +781,6 @@ class NovelParser:
         twist_marker_count = sum(text.count(marker) for marker in TWIST_MARKERS)
         suggested_path = "intelligent" if twist_marker_count >= 5 or chapter_heading_hits == 0 else "guided_rule"
         suggested_rule_type = "separator" if separator_hits >= 2 else "title"
-        if chapter_heading_hits == 0 and twist_marker_count >= 4:
-            suggested_rule_type = "rhythm"
 
         return {
             "total_chars": self._compact_len(text),
@@ -566,15 +792,26 @@ class NovelParser:
             "suggested_rule_type": suggested_rule_type,
         }
 
-    def _build_parser_system_prompt(self, *, options: dict, analysis: dict) -> str:
+    def _build_parser_system_prompt(self, *, options: dict, analysis: dict, parse_path: str, rule_type: str) -> str:
         prompt = self.PARSER_SYSTEM_PROMPT.strip()
         extras: list[str] = []
 
-        rule_type = options.get("rule_type")
-        if rule_type == "rhythm":
-            extras.append("当前任务更偏向短剧分集，请优先依据转折点、情绪峰值和集尾挂念来划分章节，而不是机械按字数平均切分。")
+        if parse_path == "intelligent":
+            extras.extend(
+                [
+                    "当前任务是为短剧创建分集方案，而不是识别已有章节标记。",
+                    "分集目标：把故事拆成多个相对独立、各有吸引力的短集，避免整篇只产出一集。",
+                    "观众视角：每集都应有推进价值，且结尾要保留继续观看动机。",
+                    "分集数量参考：短篇（约500-1500字）优先拆为2-3集；中篇（约1500-4000字）优先拆为3-5集；长篇可拆为5-12集。",
+                    "优先在以下边界分集：情绪转折、信息揭露、冲突升级、目标改变、关系变化、悬念建立。",
+                    "每集理想结尾：反转、悬念、高潮、关键对话中断中的至少一种。",
+                    "禁止机械按字数平均切分；也不要在毫无叙事意义的位置生硬断开。",
+                ]
+            )
         elif rule_type == "separator":
             extras.append("如果原文里存在明显分隔符，请优先将这些分隔符视为候选边界。")
+        elif rule_type == "custom":
+            extras.append("用户提供了自定义分割规则，请优先遵循该规则进行候选切分。")
         else:
             extras.append("如果原文已有明确章标题，请优先保留其结构和顺序。")
 
@@ -590,10 +827,6 @@ class NovelParser:
         if cliffhanger_style:
             extras.append(f"章节结尾风格偏向 {cliffhanger_style}，请让标题和边界尽量服务于这种留念感。")
 
-        if options.get("target_platform"):
-            extras.append(f"目标平台为 {options['target_platform']}，请让结构更贴近该平台的观看节奏。")
-        if options.get("target_audience"):
-            extras.append(f"目标观众为 {options['target_audience']}，标题和切分节奏要更贴近这类观众。")
         if options.get("content_genre"):
             extras.append(f"内容类型为 {options['content_genre']}，请保持相应题材的节奏特征。")
 

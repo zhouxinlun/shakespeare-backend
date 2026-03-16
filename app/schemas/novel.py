@@ -112,12 +112,12 @@ class NovelStatsOut(BaseModel):
 class NovelParseRequest(BaseModel):
     raw_text: str
     mode: Literal["auto", "rule_only", "ai_only"] = "auto"
-    rule_type: Optional[Literal["title", "separator", "rhythm"]] = None
+    parse_path: Literal["guided_rule", "intelligent"] = "guided_rule"
+    rule_type: Optional[Literal["title", "separator", "custom"]] = None
     separator_pattern: Optional[str] = None
+    custom_split_rule: Optional[str] = None
     twist_strategy: Optional[Literal["aggressive", "balanced", "conservative"]] = None
     cliffhanger_style: Optional[Literal["suspense", "reversal", "climax", "dialogue"]] = None
-    target_platform: Optional[str] = None
-    target_audience: Optional[str] = None
     content_genre: Optional[str] = None
 
     @field_validator("raw_text")
@@ -128,7 +128,7 @@ class NovelParseRequest(BaseModel):
             raise ValueError("raw_text 不能为空")
         return normalized
 
-    @field_validator("separator_pattern", "target_platform", "target_audience", "content_genre")
+    @field_validator("separator_pattern", "custom_split_rule", "content_genre")
     @classmethod
     def normalize_optional_parse_text(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -158,19 +158,56 @@ class NovelEvaluateLiveRequest(BaseModel):
         return normalized or None
 
 
-class NovelEvaluateBatchRequest(BaseModel):
-    novel_ids: list[int]
+ChatSkillLiteral = Literal[
+    "chapter_eval",
+    "chapter_rewrite",
+    "story_overview",
+    "character_insight",
+    "platform_advice",
+]
+
+
+class NovelChatRequest(BaseModel):
+    message: str
+    skill: Optional[ChatSkillLiteral] = None
+    novel_ids: Optional[list[int]] = None
+
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("message 不能为空")
+        return normalized
 
     @field_validator("novel_ids")
     @classmethod
-    def validate_novel_ids(cls, value: list[int]) -> list[int]:
+    def validate_novel_ids(cls, value: Optional[list[int]]) -> Optional[list[int]]:
+        if value is None:
+            return None
         if not value:
-            raise ValueError("novel_ids 不能为空")
+            return None
         if len(value) != len(set(value)):
             raise ValueError("novel_ids 不能重复")
         if any(item <= 0 for item in value):
             raise ValueError("novel_ids 必须全部为正整数")
         return value
+
+
+class NovelChatMessageOut(BaseModel):
+    id: int
+    role: Literal["user", "assistant"]
+    message: str
+    skill: Optional[ChatSkillLiteral] = None
+    novel_ids: list[int] = Field(default_factory=list)
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class NovelChatHistoryOut(BaseModel):
+    total: int
+    messages: list[NovelChatMessageOut]
 
 
 class NovelEvaluateBookRequest(BaseModel):
