@@ -1,5 +1,6 @@
 import unittest
 import sys
+from datetime import datetime, timedelta, timezone
 from types import ModuleType
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -70,6 +71,54 @@ def _structured_response(content: str):
 
 
 class TestLLMFallback(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_falls_back_to_global_text_strategy_when_map_missing(self):
+        now = datetime.now(timezone.utc)
+        db = _FakeDB(
+            map_entry=None,
+            configs=[
+                SimpleNamespace(
+                    id=1,
+                    type="text",
+                    manufacturer="openai",
+                    model="gpt-4o-mini",
+                    api_key="sk-1",
+                    base_url=None,
+                    last_test_status="passed",
+                    last_tested_at=now,
+                    created_at=now,
+                ),
+                SimpleNamespace(
+                    id=2,
+                    type="text",
+                    manufacturer="anthropic",
+                    model="claude-3-5-sonnet",
+                    api_key="sk-2",
+                    base_url=None,
+                    last_test_status=None,
+                    last_tested_at=now - timedelta(hours=1),
+                    created_at=now - timedelta(hours=1),
+                ),
+            ],
+        )
+
+        mock_acompletion = AsyncMock(return_value=_stream_response(["ok"]))
+        fake_litellm = ModuleType("litellm")
+        fake_litellm.acompletion = mock_acompletion
+        with patch.dict(sys.modules, {"litellm": fake_litellm}):
+            chunks: list[str] = []
+            async for item in call_llm_stream(
+                messages=[{"role": "user", "content": "hi"}],
+                config_key="novel_evaluator",
+                db=db,  # type: ignore[arg-type]
+                user_id=1,
+            ):
+                if isinstance(item, str):
+                    chunks.append(item)
+
+        self.assertEqual("".join(chunks), "ok")
+        kwargs = mock_acompletion.await_args.kwargs
+        self.assertEqual(kwargs["model"], "openai/gpt-4o-mini")
+
     async def test_stream_passes_user_id_to_config_lookup(self):
         db = object()
         mock_get_configs = AsyncMock(

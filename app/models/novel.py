@@ -84,17 +84,50 @@ class BookEvaluation(Base):
     )
 
 
-class NovelChatMessage(Base):
-    __tablename__ = "novel_chat_messages"
+class NovelChatSession(Base):
+    __tablename__ = "novel_chat_sessions"
     __table_args__ = (
-        Index("idx_novel_chat_messages_project_user_created", "project_id", "user_id", "created_at"),
+        Index(
+            "idx_novel_chat_sessions_project_user_last_message",
+            "project_id",
+            "user_id",
+            "last_message_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
+    title: Mapped[Optional[str]] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=utc_now_naive,
+        onupdate=utc_now_naive,
+    )
+    last_message_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)
+
+
+class NovelChatMessage(Base):
+    __tablename__ = "novel_chat_messages"
+    __table_args__ = (
+        Index("idx_novel_chat_messages_project_user_created", "project_id", "user_id", "created_at"),
+        Index("idx_novel_chat_messages_session_created", "session_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("novel_chat_sessions.id", ondelete="CASCADE"),
+    )
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("projects.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
     role: Mapped[str] = mapped_column(String(20))
     message: Mapped[str] = mapped_column(Text)
     skill: Mapped[Optional[str]] = mapped_column(String(50))
+    artifact_type: Mapped[Optional[str]] = mapped_column(String(50))
+    artifact_status: Mapped[Optional[str]] = mapped_column(String(30))
+    requires_confirmation: Mapped[bool] = mapped_column(default=False)
+    artifact_payload: Mapped[Optional[dict]] = mapped_column(JSONB)
     selected_novel_ids: Mapped[list] = mapped_column(JSONB, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now_naive)

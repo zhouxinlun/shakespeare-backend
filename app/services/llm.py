@@ -4,6 +4,8 @@ LLM 服务层 - 封装 liteLLM，支持多 provider
 """
 import json
 import logging
+import os
+from datetime import datetime
 from urllib.parse import urlparse, urlunparse
 from typing import Any, AsyncIterator, Awaitable, Callable, Literal, Optional, Type, TypeVar, TypedDict
 
@@ -50,6 +52,17 @@ MANUFACTURER_PREFIX = {
     "other": "openai/",
 }
 
+CONFIG_KEY_TYPE = {
+    "outlineScriptAgent": "text",
+    "storyboardAgent": "text",
+    "generateScript": "text",
+    "assetsPrompt": "text",
+    "assetsImage": "image",
+    "videoPrompt": "text",
+    "novel_parser": "text",
+    "novel_evaluator": "text",
+}
+
 FALLBACK_STATUS_CODES = {408, 429, 502, 503, 504}
 NON_FALLBACK_STATUS_CODES = {400, 401}
 NON_FALLBACK_HINTS = (
@@ -73,35 +86,95 @@ FALLBACK_HINTS = (
 )
 
 
+def _get_litellm():
+    """
+    统一初始化 LiteLLM 运行选项，尽量减少无关噪音日志。
+    """
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+    import litellm
+
+    litellm.suppress_debug_info = True
+    return litellm
+
+
+def _is_response_format_unsupported_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return (
+        "response_format.type" in text
+        and (
+            "not supported" in text
+            or "not valid" in text
+            or "invalidparameter" in text
+        )
+        and "json_object" in text
+    )
+
+
 async def _get_configs(key: str, db: AsyncSession, *, user_id: int) -> list[AIConfig]:
     """根据 agent key 从数据库查询完整模型链（主模型 + fallback）"""
     map_entry = await db.scalar(select(AIModelMap).where(AIModelMap.key == key))
-    if not map_entry or not map_entry.config_id:
-        return []
+    if map_entry and map_entry.config_id:
+        ordered_ids: list[int] = []
+        seen: set[int] = set()
 
-    ordered_ids: list[int] = []
-    seen: set[int] = set()
+        for raw_id in [map_entry.config_id, *(map_entry.fallback_config_ids or [])]:
+            if not isinstance(raw_id, int):
+                continue
+            if raw_id in seen:
+                continue
+            ordered_ids.append(raw_id)
+            seen.add(raw_id)
 
-    for raw_id in [map_entry.config_id, *(map_entry.fallback_config_ids or [])]:
-        if not isinstance(raw_id, int):
-            continue
-        if raw_id in seen:
-            continue
-        ordered_ids.append(raw_id)
-        seen.add(raw_id)
+        if ordered_ids:
+            result = await db.execute(
+                select(AIConfig).where(
+                    AIConfig.id.in_(ordered_ids),
+                    AIConfig.user_id == user_id,
+                )
+            )
+            config_rows = result.scalars().all()
+            config_by_id = {c.id: c for c in config_rows}
+            ordered_configs = [config_by_id[cid] for cid in ordered_ids if cid in config_by_id]
+            if ordered_configs:
+                return ordered_configs
 
-    if not ordered_ids:
+    config_type = CONFIG_KEY_TYPE.get(key)
+    if not config_type:
         return []
 
     result = await db.execute(
         select(AIConfig).where(
-            AIConfig.id.in_(ordered_ids),
+            AIConfig.type == config_type,
             AIConfig.user_id == user_id,
         )
     )
-    config_rows = result.scalars().all()
-    config_by_id = {c.id: c for c in config_rows}
-    return [config_by_id[cid] for cid in ordered_ids if cid in config_by_id]
+    config_rows = list(result.scalars().all())
+    if not config_rows:
+        return []
+
+    def _status_rank(status: Optional[str]) -> int:
+        if status == "passed":
+            return 0
+        if status == "failed":
+            return 2
+        return 1
+
+    def _to_timestamp(value: Any) -> float:
+        if isinstance(value, datetime):
+            return value.timestamp()
+        return 0.0
+
+    config_rows.sort(
+        key=lambda cfg: (
+            _status_rank(getattr(cfg, "last_test_status", None)),
+            -_to_timestamp(getattr(cfg, "last_tested_at", None)),
+            -_to_timestamp(getattr(cfg, "created_at", None)),
+            -int(getattr(cfg, "id", 0)),
+        )
+    )
+    logger.info("AI 配置映射 %s 未绑定，已回退到全局 %s 模型策略", key, config_type)
+    return config_rows
 
 
 def _build_model_string(config: AIConfig) -> str:
@@ -344,7 +417,7 @@ async def call_llm_stream(
     """
     调用 LLM，返回 async iterator of text chunks（SSE 流式）
     """
-    import litellm
+    litellm = _get_litellm()
 
     configs = await _get_configs(config_key, db, user_id=user_id)
     if not configs:
@@ -396,7 +469,7 @@ async def call_llm_structured(
     """
     调用 LLM，返回结构化 Pydantic 对象（用于大纲数据等）
     """
-    import litellm
+    litellm = _get_litellm()
 
     configs = await _get_configs(config_key, db, user_id=user_id)
     if not configs:
@@ -427,6 +500,27 @@ async def call_llm_structured(
             data = json.loads(content)
             return response_model.model_validate(data)
         except Exception as exc:
+            if _is_response_format_unsupported_error(exc):
+                logger.info(
+                    "Structured output fallback: model does not support response_format json_object, retrying without response_format. model=%s key=%s",
+                    config.model,
+                    config_key,
+                )
+                plain_kwargs = _build_completion_kwargs(
+                    config=config,
+                    messages=full_messages,
+                    stream=False,
+                )
+                try:
+                    response = await litellm.acompletion(**plain_kwargs)
+                    content = _extract_response_message_content(response)
+                    data = json.loads(content)
+                    return response_model.model_validate(data)
+                except Exception as plain_exc:
+                    fallbackable = isinstance(plain_exc, (json.JSONDecodeError, ValidationError)) or _is_fallbackable_error(plain_exc)
+                    if not fallbackable:
+                        raise
+                    exc = plain_exc
             fallbackable = isinstance(exc, (json.JSONDecodeError, ValidationError)) or _is_fallbackable_error(exc)
             if not fallbackable:
                 raise

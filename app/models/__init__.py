@@ -1,6 +1,6 @@
 from app.models.user import User
 from app.models.project import Project
-from app.models.novel import Novel, NovelEvaluation, BookEvaluation, NovelChatMessage
+from app.models.novel import Novel, NovelEvaluation, BookEvaluation, NovelChatMessage, NovelChatSession
 from app.models.outline import Outline, Storyline
 from app.models.script import Script
 from app.models.storyboard import Storyboard
@@ -10,5 +10,5 @@ from app.models.task import Task
 
 __all__ = [
     "User", "Project", "Novel", "NovelEvaluation", "BookEvaluation", "Outline", "Storyline",
-    "NovelChatMessage", "Script", "Storyboard", "Asset", "AIConfig", "AIModelMap", "ProviderBaseURLMap", "Prompt", "Task"
+    "NovelChatMessage", "NovelChatSession", "Script", "Storyboard", "Asset", "AIConfig", "AIModelMap", "ProviderBaseURLMap", "Prompt", "Task"
 ]

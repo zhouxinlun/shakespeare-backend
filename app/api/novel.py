@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from typing import AsyncIterator, List
@@ -10,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_current_user
 from app.database import get_db
-from app.models.novel import BookEvaluation, Novel, NovelChatMessage, NovelEvaluation
+from app.models.novel import BookEvaluation, Novel, NovelChatMessage, NovelChatSession, NovelEvaluation
 from app.models.project import Project
 from app.models.user import User
 from app.schemas.novel import (
@@ -20,6 +21,8 @@ from app.schemas.novel import (
     NovelChatHistoryOut,
     NovelChatMessageOut,
     NovelChatRequest,
+    NovelChatSessionListOut,
+    NovelChatSessionOut,
     NovelEvaluateBookRequest,
     NovelEvaluationOut,
     NovelEvaluateLiveRequest,
@@ -27,17 +30,25 @@ from app.schemas.novel import (
     NovelOut,
     NovelParseRequest,
     NovelReorderRequest,
+    NovelRewriteApplyRequest,
+    NovelRewriteApplyResult,
     NovelStatsOut,
     NovelUpdate,
 )
 from app.services.novel_book_evaluator import NovelBookEvaluator
 from app.services.novel_chat import recommend_chat_skill
+from app.services.novel_chat_artifacts import (
+    build_rewrite_artifact_from_text,
+    generate_character_topology_artifact,
+    generate_storyline_artifact,
+)
 from app.services.novel_evaluator import get_evaluator_by_content_type
-from app.services.llm import call_llm_stream
+from app.services.llm import call_llm_stream, call_llm_structured
 from app.services.novel_parser import NovelParser
 
 router = APIRouter(tags=["novel"])
 novel_router = APIRouter(prefix="/projects/{project_id}/novels", tags=["novel"])
+logger = logging.getLogger(__name__)
 NOVEL_CHAT_SKILL_HINTS = {
     "chapter_eval": "按章节做精准评估，给出问题定位、分数解释和优先级建议。",
     "chapter_rewrite": "按用户目标改写指定章节，保持人设与主线一致，给出可直接替换的文本。",
@@ -51,40 +62,106 @@ NOVEL_CHAT_SKILL_PROMPTS = {
         "1) 问题定位（引用章节号）"
         "2) 原因分析"
         "3) 可执行修改动作（按优先级 high/medium/low）。"
+        "请尽量使用这些标题组织回答："
+        "【问题】、【原因】、【建议】。"
     ),
     "chapter_rewrite": (
-        "你在本轮按章节改写模式工作。请按“改写意图 -> 可替换正文 -> 修改说明”输出，"
+        "你在本轮按章节改写模式工作。请严格按以下标题输出："
+        "【改写意图】"
+        "【修改范围】（列出将被修改的章节范围，如：第2章；第3章）"
+        "然后对每个要修改的章节，依次输出："
+        "【修改项1-章节】"
+        "【修改项1-标题】（没有则写原题）"
+        "【修改项1-原文定位】（指出将替换的段落/片段）"
+        "【修改项1-建议替换片段】"
+        "【修改项1-修改原因】"
+        "【修改项1-整章替换正文】"
+        "如果有多个章节，继续输出【修改项2-章节】...【修改项2-整章替换正文】。"
+        "其中【修改项N-整章替换正文】必须给出可直接落库替换的完整正文，不要只给片段。"
         "并保持人物设定、叙事视角和主线因果不漂移。"
     ),
     "story_overview": (
-        "你在本轮全书梳理模式工作。请给出“主线摘要 -> 分集节奏 -> 结构风险 -> 下一步优化路线”，"
+        "你在本轮全书梳理模式工作。请尽量使用这些标题输出："
+        "【主线摘要】"
+        "【分集节奏】"
+        "【结构风险】"
+        "【下一步优化路线】"
         "并明确建议应落到哪些章节。"
     ),
     "character_insight": (
-        "你在本轮人物分析模式工作。请输出“角色目标/阻碍/转变 -> 关系张力 -> 可做冲突与反转点”，"
+        "你在本轮人物分析模式工作。请尽量使用这些标题输出："
+        "【核心人物】"
+        "【关系张力】"
+        "【可做冲突与反转点】"
+        "【建议动作】"
         "避免泛泛分析。"
     ),
     "platform_advice": (
-        "你在本轮平台建议模式工作。请结合内容类型与当前文本，给出“目标平台画像 -> 标题包装 -> 开篇节奏优化"
-        " -> 分集长度/挂念建议”。"
+        "你在本轮平台建议模式工作。请尽量使用这些标题输出："
+        "【目标平台画像】"
+        "【标题包装】"
+        "【开篇节奏优化】"
+        "【分集长度/挂念建议】"
+        "请结合内容类型与当前文本给出建议。"
     ),
 }
 NOVEL_CHAT_HISTORY_LIMIT = 12
+NOVEL_REWRITE_APPLY_PROMPT = """你是资深小说改稿编辑，负责在用户确认后，基于原章节与改写建议生成最终可落库版本。
+
+输出要求：
+1. 只针对当前目标章节改写，不要扩写到其他章节。
+2. 必须综合原文、改写意图、建议替换片段、候选整章草稿，生成一版最终完整正文。
+3. 保持人物设定、叙事视角、世界观事实、时间线一致；若建议与原文冲突，以“尽量少破坏既有设定”为原则修正。
+4. 如果提供了原文定位/建议替换片段，要优先落实这些修改目标，但最终输出必须是完整章节正文，不是局部片段。
+5. chapter_title 可根据建议微调；若无需修改，返回原题或 null。
+6. rationale 用 1-2 句话概括本次改写落实了什么，不要写成“已保存到系统”。
+"""
 
 NOVEL_CHAT_SYSTEM_PROMPT = """你是小说改编与内容诊断顾问，目标是帮助用户高效改进当前项目的章节。
 
 输出要求：
 1. 回答必须可执行，优先给具体章节、具体改法、具体理由。
 2. 涉及“评估”时，请按“问题 -> 原因 -> 建议”格式组织。
-3. 涉及“改写”时，请直接给可替换正文，并说明改写意图。
-4. 当用户选择了章节范围，只围绕这些章节回答；若未指定，则可先概览再给聚焦建议。
-5. 不编造不存在的章节内容；信息不足时明确说明并给下一步输入建议。
+3. 涉及“改写”时，你输出的是“待确认的修改方案”，不是直接完成系统落库。
+4. 当用户说“按你的建议改”“帮我改一下”“直接修改”等，必须输出结构化修改计划，供前端确认，不要写“已修改完成”。
+5. 改写场景必须明确：修改哪些章节、哪些片段、为什么改、改成什么。
+6. 即使你给出整章替换正文，也要先给修改范围和修改项说明。
+7. 严禁把“建议已应用/修改完成/已经替换”说成既成事实，因为真正落库要等待用户确认。
+8. 当用户选择了章节范围，只围绕这些章节回答；若未指定，则可先概览再给聚焦建议。
+9. 不编造不存在的章节内容；信息不足时明确说明并给下一步输入建议。
 """
 
 
 def _count_words(text: str) -> int:
     compact = re.sub(r"\s+", "", text or "")
     return len(compact)
+
+
+def _extract_chapter_indices_from_message(message: str) -> list[int]:
+    text = (message or "").strip()
+    if not text:
+        return []
+
+    indices: set[int] = set()
+
+    range_pattern = re.compile(
+        r"第?\s*(\d+)\s*(?:章|回|节|集)?\s*(?:到|至|[-~—－])\s*第?\s*(\d+)\s*(?:章|回|节|集)?"
+    )
+    for start_raw, end_raw in range_pattern.findall(text):
+        start = int(start_raw)
+        end = int(end_raw)
+        if start <= 0 or end <= 0:
+            continue
+        lo, hi = sorted((start, end))
+        indices.update(range(lo, hi + 1))
+
+    single_pattern = re.compile(r"第\s*(\d+)\s*(?:章|回|节|集)")
+    for matched in single_pattern.findall(text):
+        value = int(matched)
+        if value > 0:
+            indices.add(value)
+
+    return sorted(indices)
 
 
 def _serialize_chat_message(message: NovelChatMessage) -> NovelChatMessageOut:
@@ -95,11 +172,51 @@ def _serialize_chat_message(message: NovelChatMessage) -> NovelChatMessageOut:
         novel_ids = []
     return NovelChatMessageOut(
         id=message.id,
+        session_id=message.session_id,
         role=role,
         message=message.message,
         skill=skill,
+        artifact_type=message.artifact_type,
+        artifact_status=message.artifact_status,
+        requires_confirmation=bool(message.requires_confirmation),
+        artifact_payload=message.artifact_payload if isinstance(message.artifact_payload, dict) else None,
         novel_ids=[int(item) for item in novel_ids if isinstance(item, int)],
         created_at=message.created_at,
+    )
+
+
+def _truncate_chat_text(text: str | None, limit: int = 60) -> str | None:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    compact = re.sub(r"\s+", " ", raw)
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(8, limit - 1)].rstrip() + "…"
+
+
+def _build_chat_session_title(message: str | None, fallback_time: datetime | None = None) -> str:
+    title = _truncate_chat_text(message, 26)
+    if title:
+        return title
+    time_part = (fallback_time or datetime.now(timezone.utc)).astimezone().strftime("%m-%d %H:%M")
+    return f"新会话 {time_part}"
+
+
+def _serialize_chat_session(
+    session: NovelChatSession,
+    *,
+    message_count: int = 0,
+    preview: str | None = None,
+) -> NovelChatSessionOut:
+    return NovelChatSessionOut(
+        id=session.id,
+        title=session.title,
+        preview=_truncate_chat_text(preview, 72),
+        message_count=int(message_count or 0),
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        last_message_at=session.last_message_at,
     )
 
 
@@ -111,6 +228,26 @@ async def _get_user_project(project_id: int, user: User, db: AsyncSession) -> Pr
     if not project:
         raise HTTPException(status_code=404, detail="项目不存在")
     return project
+
+
+async def _get_chat_session(
+    *,
+    project_id: int,
+    session_id: int,
+    user: User,
+    db: AsyncSession,
+) -> NovelChatSession:
+    result = await db.execute(
+        select(NovelChatSession).where(
+            NovelChatSession.id == session_id,
+            NovelChatSession.project_id == project_id,
+            NovelChatSession.user_id == user.id,
+        )
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return session
 
 
 async def _get_latest_evaluation(
@@ -125,6 +262,35 @@ async def _get_latest_evaluation(
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+def _should_reuse_previous_scope(message: str) -> bool:
+    text = (message or "").strip()
+    if not text:
+        return False
+    hints = ("继续", "再", "上一章", "这一章", "这章", "这些章节", "上述", "刚才", "上面")
+    return any(hint in text for hint in hints)
+
+
+def _looks_like_confirmed_rewrite(message: str) -> bool:
+    text = (message or "").strip()
+    if not text:
+        return False
+    hints = (
+        "按你的建议改",
+        "按照你的建议改",
+        "按建议改",
+        "按照建议改",
+        "帮我改",
+        "帮我修改",
+        "帮我更改",
+        "直接改",
+        "直接修改",
+        "好的，改吧",
+        "那就改吧",
+        "修改吧",
+    )
+    return any(hint in text for hint in hints)
 
 
 def _build_evaluation_record(
@@ -186,6 +352,57 @@ def _serialize_book_evaluation(evaluation: BookEvaluation) -> dict:
     }
 
 
+def _build_eval_artifact_payload(evaluation: NovelEvaluation) -> dict:
+    return {
+        "novel_id": evaluation.novel_id,
+        "overall_score": evaluation.overall_score,
+        "dimension_scores": evaluation.dimension_scores or {},
+        "summary": evaluation.summary,
+        "suggestions": evaluation.suggestions or [],
+        "evaluation": _serialize_evaluation(evaluation),
+    }
+
+
+def _render_eval_report(evaluator, novel: Novel, evaluation_data: dict) -> str:
+    dimension_scores = evaluation_data.get("dimension_scores") or {}
+    summary = str(evaluation_data.get("summary") or "").strip()
+    suggestions = evaluation_data.get("suggestions") or []
+    dimension_meta = getattr(evaluator, "profile", {}).get("dimensions", {})
+
+    score_lines = []
+    for key, score in dimension_scores.items():
+        label = dimension_meta.get(key, {}).get("label", key)
+        try:
+            score_value = round(float(score), 2)
+        except (TypeError, ValueError):
+            score_value = score
+        score_lines.append(f"- {label}：{score_value}")
+
+    suggestion_lines = []
+    for item in suggestions[:4]:
+        if not isinstance(item, dict):
+            continue
+        dimension = str(item.get("dimension") or "")
+        label = dimension_meta.get(dimension, {}).get("label", dimension or "建议")
+        suggestion = str(item.get("suggestion") or "").strip()
+        issue = str(item.get("issue") or "").strip()
+        if suggestion:
+            suggestion_lines.append(f"- {label}：{suggestion}" + (f"（问题：{issue}）" if issue else ""))
+
+    title = novel.chapter_title or f"第{novel.chapter_index}章"
+    parts = [
+        f"【章节评估】第{novel.chapter_index}章《{title}》",
+        f"【总分】{evaluation_data.get('overall_score', '')}",
+    ]
+    if summary:
+        parts.append(f"【总结】\n{summary}")
+    if score_lines:
+        parts.append("【维度得分】\n" + "\n".join(score_lines))
+    if suggestion_lines:
+        parts.append("【优先建议】\n" + "\n".join(suggestion_lines))
+    return "\n\n".join(parts)
+
+
 def _make_sse(event: dict) -> str:
     payload = json.dumps(event, ensure_ascii=False)
     if event.get("type") == "fallback_warning":
@@ -195,8 +412,12 @@ def _make_sse(event: dict) -> str:
 
 def _stream_response(gen: AsyncIterator[dict]) -> StreamingResponse:
     async def _stream():
-        async for event in gen:
-            yield _make_sse(event)
+        try:
+            async for event in gen:
+                yield _make_sse(event)
+        except Exception as exc:
+            logger.exception("Novel SSE stream failed")
+            yield _make_sse({"type": "error", "message": str(exc)})
 
     return StreamingResponse(
         _stream(),
@@ -344,6 +565,16 @@ async def reorder_novels(
         raise HTTPException(status_code=400, detail="reorder 需要提交项目全部章节顺序")
 
     chapter_index_map = {item.novel_id: item.chapter_index for item in body.orders}
+    current_max_index = max((int(novel.chapter_index or 0) for novel in novels), default=0)
+    target_max_index = max(chapter_indices, default=0)
+    temp_base = max(current_max_index, target_max_index) + len(novels) + 100
+
+    # 两段式更新，避免 (project_id, chapter_index) 唯一索引在交换序号时发生冲突
+    for novel in novels:
+        novel.chapter_index = temp_base + chapter_index_map[novel.id]
+
+    await db.flush()
+
     for novel in novels:
         novel.chapter_index = chapter_index_map[novel.id]
 
@@ -374,9 +605,121 @@ async def parse_novel(
     return _stream_response(stream())
 
 
+@novel_router.get("/chat/sessions", response_model=NovelChatSessionListOut)
+async def list_chat_sessions(
+    project_id: int,
+    limit: int = 40,
+    offset: int = 0,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_user_project(project_id, user, db)
+
+    if limit <= 0 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit 取值范围为 1-100")
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset 不能小于 0")
+
+    message_count_subquery = (
+        select(
+            NovelChatMessage.session_id.label("session_id"),
+            func.count(NovelChatMessage.id).label("message_count"),
+        )
+        .group_by(NovelChatMessage.session_id)
+        .subquery()
+    )
+    last_message_subquery = (
+        select(
+            NovelChatMessage.session_id.label("session_id"),
+            NovelChatMessage.message.label("message"),
+            func.row_number()
+            .over(
+                partition_by=NovelChatMessage.session_id,
+                order_by=(NovelChatMessage.created_at.desc(), NovelChatMessage.id.desc()),
+            )
+            .label("rn"),
+        )
+        .subquery()
+    )
+
+    total = await db.scalar(
+        select(func.count(NovelChatSession.id)).where(
+            NovelChatSession.project_id == project_id,
+            NovelChatSession.user_id == user.id,
+        )
+    )
+    result = await db.execute(
+        select(
+            NovelChatSession,
+            func.coalesce(message_count_subquery.c.message_count, 0),
+            last_message_subquery.c.message,
+        )
+        .outerjoin(
+            message_count_subquery,
+            message_count_subquery.c.session_id == NovelChatSession.id,
+        )
+        .outerjoin(
+            last_message_subquery,
+            and_(
+                last_message_subquery.c.session_id == NovelChatSession.id,
+                last_message_subquery.c.rn == 1,
+            ),
+        )
+        .where(
+            NovelChatSession.project_id == project_id,
+            NovelChatSession.user_id == user.id,
+        )
+        .order_by(NovelChatSession.last_message_at.desc(), NovelChatSession.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    sessions = [
+        _serialize_chat_session(session, message_count=message_count, preview=preview)
+        for session, message_count, preview in result.all()
+    ]
+    return NovelChatSessionListOut(total=int(total or 0), sessions=sessions)
+
+
+@novel_router.post("/chat/sessions", response_model=NovelChatSessionOut)
+async def create_chat_session(
+    project_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_user_project(project_id, user, db)
+    display_now = datetime.now(tz=timezone.utc)
+    now = display_now.replace(tzinfo=None)
+    session = NovelChatSession(
+        project_id=project_id,
+        user_id=user.id,
+        title=_build_chat_session_title(None, display_now),
+        last_message_at=now,
+    )
+    db.add(session)
+    await db.flush()
+    await db.commit()
+    await db.refresh(session)
+    return _serialize_chat_session(session)
+
+
+@novel_router.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(
+    project_id: int,
+    session_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_user_project(project_id, user, db)
+    session = await _get_chat_session(project_id=project_id, session_id=session_id, user=user, db=db)
+    await db.delete(session)
+    await db.commit()
+    return {"code": 0, "msg": "会话已删除"}
+
+
 @novel_router.get("/chat/history", response_model=NovelChatHistoryOut)
 async def list_chat_history(
     project_id: int,
+    session_id: int | None = None,
     limit: int = 80,
     offset: int = 0,
     user: User = Depends(get_current_user),
@@ -389,18 +732,18 @@ async def list_chat_history(
     if offset < 0:
         raise HTTPException(status_code=400, detail="offset 不能小于 0")
 
-    total = await db.scalar(
-        select(func.count(NovelChatMessage.id)).where(
-            NovelChatMessage.project_id == project_id,
-            NovelChatMessage.user_id == user.id,
-        )
-    )
+    filters = [
+        NovelChatMessage.project_id == project_id,
+        NovelChatMessage.user_id == user.id,
+    ]
+    if session_id is not None:
+        await _get_chat_session(project_id=project_id, session_id=session_id, user=user, db=db)
+        filters.append(NovelChatMessage.session_id == session_id)
+
+    total = await db.scalar(select(func.count(NovelChatMessage.id)).where(*filters))
     result = await db.execute(
         select(NovelChatMessage)
-        .where(
-            NovelChatMessage.project_id == project_id,
-            NovelChatMessage.user_id == user.id,
-        )
+        .where(*filters)
         .order_by(NovelChatMessage.created_at.desc(), NovelChatMessage.id.desc())
         .limit(limit)
         .offset(offset)
@@ -420,9 +763,9 @@ async def clear_chat_history(
 ):
     await _get_user_project(project_id, user, db)
     await db.execute(
-        delete(NovelChatMessage).where(
-            NovelChatMessage.project_id == project_id,
-            NovelChatMessage.user_id == user.id,
+        delete(NovelChatSession).where(
+            NovelChatSession.project_id == project_id,
+            NovelChatSession.user_id == user.id,
         )
     )
     await db.commit()
@@ -437,6 +780,14 @@ async def chat_novel(
     db: AsyncSession = Depends(get_db),
 ):
     project = await _get_user_project(project_id, user, db)
+    logger.info(
+        "novel chat request start project=%s user=%s session=%s skill=%s message=%s",
+        project_id,
+        user.id,
+        body.session_id,
+        body.skill,
+        (body.message or "")[:120],
+    )
 
     result = await db.execute(
         select(Novel).where(Novel.project_id == project_id).order_by(Novel.chapter_index)
@@ -445,20 +796,27 @@ async def chat_novel(
     if not novels:
         raise HTTPException(status_code=400, detail="当前项目暂无章节，无法进行小说 Chat")
 
-    selected_novels = novels
-    selected_novel_ids = body.novel_ids or []
-    if body.novel_ids:
-        selected_ids = set(body.novel_ids)
-        selected_novels = [item for item in novels if item.id in selected_ids]
-        if len(selected_novels) != len(selected_ids):
-            raise HTTPException(status_code=404, detail="novel_ids 中存在无效章节")
+    created_session = False
+    if body.session_id is not None:
+        session = await _get_chat_session(
+            project_id=project_id,
+            session_id=body.session_id,
+            user=user,
+            db=db,
+        )
+    else:
+        session = NovelChatSession(
+            project_id=project_id,
+            user_id=user.id,
+            title=_build_chat_session_title(body.message),
+        )
+        db.add(session)
+        await db.flush()
+        created_session = True
 
     recent_chat_result = await db.execute(
         select(NovelChatMessage)
-        .where(
-            NovelChatMessage.project_id == project_id,
-            NovelChatMessage.user_id == user.id,
-        )
+        .where(NovelChatMessage.session_id == session.id)
         .order_by(NovelChatMessage.created_at.desc(), NovelChatMessage.id.desc())
         .limit(NOVEL_CHAT_HISTORY_LIMIT)
     )
@@ -469,10 +827,69 @@ async def chat_novel(
         if item.role in {"user", "assistant"} and (item.message or "").strip()
     ]
 
+    selected_novels = novels
+    selected_novel_ids = body.novel_ids or []
+    explicit_scope = bool(body.novel_ids)
+    parsed_chapter_indices = _extract_chapter_indices_from_message(body.message)
+    reused_previous_scope = False
+
+    if body.novel_ids:
+        selected_ids = set(body.novel_ids)
+        selected_novels = [item for item in novels if item.id in selected_ids]
+        if len(selected_novels) != len(selected_ids):
+            raise HTTPException(status_code=404, detail="novel_ids 中存在无效章节")
+    elif parsed_chapter_indices:
+        selected_index_set = set(parsed_chapter_indices)
+        selected_novels = [item for item in novels if item.chapter_index in selected_index_set]
+        if len(selected_novels) != len(selected_index_set):
+            missing = sorted(selected_index_set - {item.chapter_index for item in selected_novels})
+            raise HTTPException(status_code=404, detail=f"消息中引用了不存在的章节：{missing}")
+        selected_novel_ids = [item.id for item in selected_novels]
+    elif _should_reuse_previous_scope(body.message):
+        for item in reversed(recent_chat_rows):
+            raw_ids = item.selected_novel_ids or []
+            if isinstance(raw_ids, list) and raw_ids:
+                selected_ids = {int(value) for value in raw_ids if isinstance(value, int)}
+                selected_novels = [novel for novel in novels if novel.id in selected_ids]
+                if selected_novels:
+                    selected_novel_ids = [novel.id for novel in selected_novels]
+                    reused_previous_scope = True
+                    break
+
+    selected_scope_label = (
+        "前端选中章节"
+        if explicit_scope
+        else "消息识别章节"
+        if parsed_chapter_indices
+        else "延续上一轮章节范围"
+        if reused_previous_scope
+        else "未指定（全书视角）"
+    )
+
     effective_skill = body.skill
     recommended_reason: str | None = None
     if not effective_skill:
         effective_skill, recommended_reason = recommend_chat_skill(body.message)
+    if not effective_skill and _looks_like_confirmed_rewrite(body.message):
+        for item in reversed(recent_chat_rows):
+            if item.role != "assistant":
+                continue
+            if item.skill in {"chapter_eval", "chapter_rewrite"}:
+                effective_skill = "chapter_rewrite"
+                recommended_reason = "检测到你正在确认上一轮建议，已延续到「章节改写」流程。"
+                break
+
+    logger.warning(
+        "novel chat resolved project=%s user=%s session=%s effective_skill=%s scope=%s novel_ids=%s parsed_chapters=%s reused_previous_scope=%s",
+        project_id,
+        user.id,
+        session.id if session else None,
+        effective_skill,
+        selected_scope_label,
+        selected_novel_ids,
+        parsed_chapter_indices,
+        reused_previous_scope,
+    )
 
     chapter_lines = [
         f"- 第{item.chapter_index}章《{item.chapter_title or f'第{item.chapter_index}章'}》"
@@ -514,7 +931,14 @@ async def chat_novel(
         system_parts.append("聚焦章节已有评估摘要：\n" + "\n".join(evaluation_briefs))
 
     async def stream():
+        now = datetime.now(tz=timezone.utc).replace(tzinfo=None)
+        if not session.title or session.title.startswith("新会话"):
+            session.title = _build_chat_session_title(body.message)
+        session.last_message_at = now
+        session.updated_at = now
+
         user_record = NovelChatMessage(
+            session_id=session.id,
             project_id=project_id,
             user_id=user.id,
             role="user",
@@ -526,12 +950,122 @@ async def chat_novel(
         await db.flush()
         await db.commit()
 
+        if created_session:
+            yield {
+                "type": "session_created",
+                "session": _serialize_chat_session(session, message_count=1, preview=body.message).model_dump(mode="json"),
+            }
         if recommended_reason and effective_skill:
             yield {
                 "type": "skill_recommendation",
                 "recommended_skill": effective_skill,
                 "reason": recommended_reason,
             }
+        yield {
+            "type": "scope_resolved",
+            "novel_ids": selected_novel_ids,
+            "chapter_indexes": [item.chapter_index for item in selected_novels],
+            "scope_label": selected_scope_label,
+        }
+
+        if effective_skill == "chapter_eval" and len(selected_novels) == 1:
+            logger.warning(
+                "novel chat chapter_eval fast-path project=%s user=%s session=%s novel_id=%s chapter_index=%s",
+                project_id,
+                user.id,
+                session.id,
+                selected_novels[0].id,
+                selected_novels[0].chapter_index,
+            )
+            yield {"type": "progress", "message": "正在进行章节多维度评分...", "progress": 12}
+            evaluator = get_evaluator_by_content_type(project.content_type)
+            try:
+                evaluation_data, fallback_events = await evaluator.evaluate_single(
+                    novel=selected_novels[0],
+                    db=db,
+                    user_id=user.id,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "novel chat chapter_eval fast-path failed project=%s user=%s session=%s novel_id=%s",
+                    project_id,
+                    user.id,
+                    session.id,
+                    selected_novels[0].id,
+                )
+                yield {"type": "error", "message": str(exc)}
+                return
+
+            for event in fallback_events:
+                yield event
+
+            previous = await _get_latest_evaluation(selected_novels[0].id, project_id, db)
+            evaluation = _build_evaluation_record(
+                novel=selected_novels[0],
+                project=project,
+                evaluation_data=evaluation_data,
+                previous=previous,
+            )
+            db.add(evaluation)
+            await db.flush()
+            await db.commit()
+            logger.warning(
+                "novel chat chapter_eval fast-path done project=%s user=%s session=%s novel_id=%s evaluation_id=%s",
+                project_id,
+                user.id,
+                session.id,
+                selected_novels[0].id,
+                evaluation.id,
+            )
+
+            assistant_message = _render_eval_report(evaluator, selected_novels[0], evaluation_data)
+            artifact_payload = _build_eval_artifact_payload(evaluation)
+            assistant_now = datetime.now(tz=timezone.utc).replace(tzinfo=None)
+            session.last_message_at = assistant_now
+            session.updated_at = assistant_now
+            assistant_record = NovelChatMessage(
+                session_id=session.id,
+                project_id=project_id,
+                user_id=user.id,
+                role="assistant",
+                message=assistant_message,
+                skill=effective_skill,
+                artifact_type="chapter_eval_report",
+                artifact_status="ready",
+                requires_confirmation=False,
+                artifact_payload=artifact_payload,
+                selected_novel_ids=selected_novel_ids,
+            )
+            db.add(assistant_record)
+            await db.flush()
+            await db.commit()
+
+            yield {
+                "type": "artifact_ready",
+                "data": {
+                    "artifact_type": "chapter_eval_report",
+                    "artifact_status": "ready",
+                    "requires_confirmation": False,
+                    "artifact_payload": artifact_payload,
+                },
+            }
+            logger.warning(
+                "novel chat chapter_eval artifact ready project=%s user=%s session=%s novel_id=%s evaluation_id=%s",
+                project_id,
+                user.id,
+                session.id,
+                selected_novels[0].id,
+                evaluation.id,
+            )
+            yield {"type": "content", "data": {"chunk": assistant_message}}
+            yield {
+                "type": "done",
+                "message": "已完成本轮小说 Chat",
+                "skill": effective_skill,
+                "session_id": session.id,
+            }
+            return
+
         yield {"type": "progress", "message": "正在分析你的请求...", "progress": 8}
         assistant_chunks: list[str] = []
         async for item in call_llm_stream(
@@ -552,18 +1086,108 @@ async def chat_novel(
 
         assistant_message = "".join(assistant_chunks).strip()
         if assistant_message:
+            logger.info(
+                "novel chat llm response complete project=%s user=%s session=%s skill=%s content_len=%s",
+                project_id,
+                user.id,
+                session.id,
+                effective_skill,
+                len(assistant_message),
+            )
+            assistant_now = datetime.now(tz=timezone.utc).replace(tzinfo=None)
+            session.last_message_at = assistant_now
+            session.updated_at = assistant_now
+            artifact_type: str | None = None
+            artifact_payload: dict | None = None
+            artifact_status: str | None = None
+            requires_confirmation = False
+
+            try:
+                if effective_skill == "chapter_eval" and len(selected_novels) == 1:
+                    evaluator = get_evaluator_by_content_type(project.content_type)
+                    evaluation_data, fallback_events = await evaluator.evaluate_single(
+                        novel=selected_novels[0],
+                        db=db,
+                        user_id=user.id,
+                    )
+                    for event in fallback_events:
+                        yield event
+                    previous = await _get_latest_evaluation(selected_novels[0].id, project_id, db)
+                    evaluation = _build_evaluation_record(
+                        novel=selected_novels[0],
+                        project=project,
+                        evaluation_data=evaluation_data,
+                        previous=previous,
+                    )
+                    db.add(evaluation)
+                    await db.flush()
+                    artifact_type = "chapter_eval_report"
+                    artifact_status = "ready"
+                    artifact_payload = _build_eval_artifact_payload(evaluation)
+                elif effective_skill == "chapter_rewrite":
+                    rewrite_payload = build_rewrite_artifact_from_text(assistant_message)
+                    if rewrite_payload:
+                        artifact_type = "rewrite_plan"
+                        artifact_status = "awaiting_confirmation"
+                        requires_confirmation = True
+                        artifact_payload = rewrite_payload
+                elif effective_skill == "story_overview":
+                    timeline_payload = await generate_storyline_artifact(
+                        selected_novels=selected_novels or novels,
+                        db=db,
+                        user_id=user.id,
+                        content_type=project.content_type,
+                    )
+                    if timeline_payload:
+                        artifact_type = "story_timeline"
+                        artifact_status = "ready"
+                        artifact_payload = timeline_payload
+                elif effective_skill == "character_insight":
+                    topology_payload = await generate_character_topology_artifact(
+                        selected_novels=selected_novels or novels,
+                        db=db,
+                        user_id=user.id,
+                        content_type=project.content_type,
+                    )
+                    if topology_payload:
+                        artifact_type = "character_topology"
+                        artifact_status = "ready"
+                        artifact_payload = topology_payload
+            except Exception:
+                logger.exception("Failed to build novel chat artifact", extra={"skill": effective_skill})
+
             assistant_record = NovelChatMessage(
+                session_id=session.id,
                 project_id=project_id,
                 user_id=user.id,
                 role="assistant",
                 message=assistant_message,
                 skill=effective_skill,
+                artifact_type=artifact_type,
+                artifact_status=artifact_status,
+                requires_confirmation=requires_confirmation,
+                artifact_payload=artifact_payload,
                 selected_novel_ids=selected_novel_ids,
             )
             db.add(assistant_record)
             await db.flush()
             await db.commit()
-        yield {"type": "done", "message": "已完成本轮小说 Chat", "skill": effective_skill}
+            if artifact_type and artifact_payload is not None:
+                yield {
+                    "type": "artifact_ready",
+                    "data": {
+                        "artifact_type": artifact_type,
+                        "artifact_status": artifact_status,
+                        "requires_confirmation": requires_confirmation,
+                        "artifact_payload": artifact_payload,
+                    },
+                }
+        yield {
+            "type": "done",
+            "message": "已完成本轮小说 Chat",
+            "skill": effective_skill,
+            "session_id": session.id,
+        }
 
     return _stream_response(stream())
 
@@ -745,6 +1369,7 @@ async def evaluate_novel(
     db: AsyncSession = Depends(get_db),
 ):
     project = await _get_user_project(project_id, user, db)
+    logger.info("evaluate_novel start project=%s user=%s novel_id=%s", project_id, user.id, novel_id)
 
     result = await db.execute(
         select(Novel).where(Novel.id == novel_id, Novel.project_id == project_id)
@@ -765,6 +1390,7 @@ async def evaluate_novel(
                 user_id=user.id,
             )
         except Exception as exc:
+            logger.exception("evaluate_novel failed project=%s user=%s novel_id=%s", project_id, user.id, novel_id)
             yield {"type": "error", "message": str(exc)}
             return
 
@@ -792,6 +1418,13 @@ async def evaluate_novel(
         db.add(evaluation)
         await db.flush()
         await db.commit()
+        logger.info(
+            "evaluate_novel done project=%s user=%s novel_id=%s evaluation_id=%s",
+            project_id,
+            user.id,
+            novel_id,
+            evaluation.id,
+        )
 
         yield {
             "type": "done",
@@ -801,6 +1434,80 @@ async def evaluate_novel(
         }
 
     return _stream_response(stream())
+
+
+@novel_router.post("/{novel_id}/rewrite-from-chat", response_model=NovelOut)
+async def rewrite_novel_from_chat(
+    project_id: int,
+    novel_id: int,
+    body: NovelRewriteApplyRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    project = await _get_user_project(project_id, user, db)
+    logger.info("rewrite_novel_from_chat start project=%s user=%s novel_id=%s", project_id, user.id, novel_id)
+
+    result = await db.execute(
+        select(Novel).where(Novel.id == novel_id, Novel.project_id == project_id)
+    )
+    novel = result.scalar_one_or_none()
+    if not novel:
+        raise HTTPException(status_code=404, detail="章节不存在")
+
+    prompt_sections = [
+        f"内容类型：{project.content_type}",
+        f"目标章节：第{novel.chapter_index}章《{novel.chapter_title or f'第{novel.chapter_index}章'}》",
+        f"原章节标题：{novel.chapter_title or '无'}",
+        "【原章节正文】\n" + (novel.content or "").strip(),
+    ]
+    if body.instruction:
+        prompt_sections.append("【上轮助手建议全文】\n" + body.instruction)
+    if body.scope_label:
+        prompt_sections.append(f"【改写范围】\n{body.scope_label}")
+    if body.reason:
+        prompt_sections.append(f"【本次改写目标】\n{body.reason}")
+    if body.chapter_index:
+        prompt_sections.append(f"【建议命中的章节号】\n第{body.chapter_index}章")
+    if body.chapter_title:
+        prompt_sections.append(f"【建议章节标题】\n{body.chapter_title}")
+    if body.original_snippet:
+        prompt_sections.append(f"【原文定位/重点片段】\n{body.original_snippet}")
+    if body.replacement_snippet:
+        prompt_sections.append(f"【建议替换片段】\n{body.replacement_snippet}")
+    if body.full_content:
+        prompt_sections.append(f"【候选整章改写稿】\n{body.full_content}")
+
+    rewrite_result = await call_llm_structured(
+        messages=[
+            {
+                "role": "user",
+                "content": (
+                    "\n\n".join(prompt_sections)
+                    + "\n\n请输出最终确认后的章节标题与完整正文。"
+                ),
+            }
+        ],
+        config_key="novel_evaluator",
+        response_model=NovelRewriteApplyResult,
+        db=db,
+        user_id=user.id,
+        system_prompt=NOVEL_REWRITE_APPLY_PROMPT,
+    )
+
+    novel.chapter_title = rewrite_result.chapter_title or body.chapter_title or novel.chapter_title
+    novel.content = rewrite_result.content
+    novel.word_count = _count_words(rewrite_result.content)
+    await db.flush()
+    await db.commit()
+    await db.refresh(novel)
+    logger.info(
+        "rewrite_novel_from_chat done project=%s user=%s novel_id=%s word_count=%s",
+        project_id,
+        user.id,
+        novel_id,
+        novel.word_count,
+    )
+    return novel
 
 
 @novel_router.put("/{novel_id}", response_model=NovelOut)

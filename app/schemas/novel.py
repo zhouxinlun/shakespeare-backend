@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class NovelCreate(BaseModel):
@@ -171,6 +171,7 @@ class NovelChatRequest(BaseModel):
     message: str
     skill: Optional[ChatSkillLiteral] = None
     novel_ids: Optional[list[int]] = None
+    session_id: Optional[int] = None
 
     @field_validator("message")
     @classmethod
@@ -179,6 +180,15 @@ class NovelChatRequest(BaseModel):
         if not normalized:
             raise ValueError("message 不能为空")
         return normalized
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError("session_id 必须为正整数")
+        return value
 
     @field_validator("novel_ids")
     @classmethod
@@ -196,9 +206,14 @@ class NovelChatRequest(BaseModel):
 
 class NovelChatMessageOut(BaseModel):
     id: int
+    session_id: int
     role: Literal["user", "assistant"]
     message: str
     skill: Optional[ChatSkillLiteral] = None
+    artifact_type: Optional[str] = None
+    artifact_status: Optional[str] = None
+    requires_confirmation: bool = False
+    artifact_payload: Optional[dict] = None
     novel_ids: list[int] = Field(default_factory=list)
     created_at: datetime
 
@@ -208,6 +223,94 @@ class NovelChatMessageOut(BaseModel):
 class NovelChatHistoryOut(BaseModel):
     total: int
     messages: list[NovelChatMessageOut]
+
+
+class NovelChatSessionOut(BaseModel):
+    id: int
+    title: Optional[str] = None
+    preview: Optional[str] = None
+    message_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+    last_message_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class NovelChatSessionListOut(BaseModel):
+    total: int
+    sessions: list[NovelChatSessionOut]
+
+
+class NovelRewriteApplyRequest(BaseModel):
+    instruction: Optional[str] = None
+    scope_label: Optional[str] = None
+    reason: Optional[str] = None
+    chapter_index: Optional[int] = None
+    chapter_title: Optional[str] = None
+    original_snippet: Optional[str] = None
+    replacement_snippet: Optional[str] = None
+    full_content: Optional[str] = None
+
+    @field_validator(
+        "instruction",
+        "scope_label",
+        "reason",
+        "chapter_title",
+        "original_snippet",
+        "replacement_snippet",
+        "full_content",
+    )
+    @classmethod
+    def normalize_optional_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("chapter_index")
+    @classmethod
+    def validate_chapter_index(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError("chapter_index 必须为正整数")
+        return value
+
+    @model_validator(mode="after")
+    def validate_has_rewrite_context(self):
+        if not any(
+            [
+                self.instruction,
+                self.reason,
+                self.replacement_snippet,
+                self.full_content,
+            ]
+        ):
+            raise ValueError("至少提供一项改写说明")
+        return self
+
+
+class NovelRewriteApplyResult(BaseModel):
+    chapter_title: Optional[str] = None
+    content: str
+    rationale: Optional[str] = None
+
+    @field_validator("chapter_title", "rationale")
+    @classmethod
+    def normalize_optional_result_text(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("content 不能为空")
+        return normalized
 
 
 class NovelEvaluateBookRequest(BaseModel):
